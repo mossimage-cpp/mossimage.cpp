@@ -330,6 +330,7 @@ struct OutModule {
   std::vector<const QuantLinear*> parts;  // 1, or q/k/v
   QuantSpec spec;
   std::int64_t n = 0, k = 0;
+  bool int4 = false;  // convrot_w4a4 output: packed [n, k/2] + per-row scale, described by _quantization_metadata
   // Indices into the tensor list (scale/scale_2/config/bias: SIZE_MAX if absent; scale_2: nvfp4 only).
   std::size_t weight = 0, scale = 0, scale_2 = 0, config = 0, bias = 0;
 };
@@ -637,6 +638,7 @@ std::vector<OutModule> plan_modules(const QuantModel& model, const ConvertOption
       if (keep) fail("--keep-bf16 matches '" + l.name + "', which the input stores quantized (the bf16 weights are gone)");
       if (loras.count(l.name)) fail("a LoRA targets '" + l.name + "', which the input stores quantized; merge into the bf16 weights instead");
       if (fp4 != nullptr) fail("'" + l.name + "' is stored " + describe(l.spec) + "; NVFP4 output is converted from the bf16 weights");
+      if (options.int4) fail("'" + l.name + "' is stored " + describe(l.spec) + "; INT4 output is converted from the bf16 weights");
       return l.spec;
     }
     if (fp4 != nullptr) {
@@ -684,6 +686,7 @@ std::vector<OutModule> plan_modules(const QuantModel& model, const ConvertOption
       om.n = l.n;
     }
     om.k = om.parts[0]->k;
+    om.int4 = options.int4 && om.spec.quantized();
     mods.push_back(std::move(om));
   }
   if (fp4 != nullptr) {
@@ -794,6 +797,11 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   util::check_user_path(output, "output");
   for (const LoraInput& li : options.loras) util::check_user_path(li.file, "LoRA");
   if (!valid_convrot_group(options.group)) fail("--group must be a power of 4 in [4, 1024]");
+  if (options.int4) {
+    if (options.nvfp4) fail("--format int4 and nvfp4 are mutually exclusive");
+    if (options.policy) fail("a spec policy cannot be combined with int4 output");
+    if (options.group != 256) fail("--format int4 rotates in 256-column groups; drop --group");
+  }
   if (options.threads < 0) fail("--threads must be >= 0");
   for (const LoraInput& li : options.loras) {
     if (!std::isfinite(li.strength)) fail("LoRA strength of " + util::path_utf8(li.file) + " is not finite");
@@ -852,8 +860,12 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   std::map<std::string, int> spec_counts;  // describe(spec) -> GEMMs written with it
   for (OutModule& om : mods) {
     om.scale = om.scale_2 = om.config = om.bias = kNone;
-    spec_counts[describe(om.spec)] += static_cast<int>(om.parts.size());
-    if (om.spec.format == QuantFormat::kNvfp4) {
+    spec_counts[om.int4 ? std::string("convrot_w4a4 g256") : describe(om.spec)] += static_cast<int>(om.parts.size());
+    if (om.int4) {
+      if (om.k % 256 != 0) fail("'" + om.name + "': K=" + std::to_string(om.k) + " is not a multiple of 256, which convrot_w4a4 needs");
+      om.weight = add(om.name + ".weight", DType::kI8, {om.n, om.k / 2});
+      om.scale = add(om.name + ".weight_scale", DType::kF32, {om.n});
+    } else if (om.spec.format == QuantFormat::kNvfp4) {
       if (om.k % kNvfp4Block != 0) fail("'" + om.name + "': K=" + std::to_string(om.k) + " is not a multiple of 16, which nvfp4 needs");
       om.weight = add(om.name + ".weight", DType::kU8, {om.n, om.k / 2});
       om.scale = add(om.name + ".weight_scale", DType::kF8E4M3, {nvfp4_scale_rows(om.n), nvfp4_scale_cols(om.k / kNvfp4Block)});
@@ -1014,7 +1026,21 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
       kept_json += "]";
       std::string specs;
       for (const auto& [name, count] : spec_counts) specs += (specs.empty() ? "" : ", ") + name + " x" + std::to_string(count);
-      if (fp4 == nullptr) {
+      if (fp4 == nullptr && options.int4) {
+        // convrot_w4a4 keeps its format in a file-level header (the community layout), not in per-tensor comfy_quant.
+        std::string layers_json = "{";
+        bool first_layer = true;
+        for (const OutModule& om : mods) {
+          if (!om.int4) continue;
+          layers_json += (first_layer ? "" : ", ") + quote(om.name) +
+                         ": {\"format\": \"convrot_w4a4\", \"convrot_groupsize\": 256, \"quant_group_size\": 64}";
+          first_layer = false;
+        }
+        layers_json += "}";
+        md["_quantization_metadata"] = "{\"format_version\": \"1.0\", \"layers\": " + layers_json + "}";
+        md["mossinfer_converter"] = "moss-infer quantize " + std::to_string(kConverterVersion) + " (" + specs +
+                                    "; convrot_w4a4 4-bit weights, per-row f32 scale)";
+      } else if (fp4 == nullptr) {
         md["mossinfer_converter"] = "moss-infer quantize " + std::to_string(kConverterVersion) + " (" + specs +
                                     (gguf ? "; GGUF input dequantized to fp32, then quantized round-to-nearest or rounded to bf16)"
                                           : "; bf16 inputs quantized round-to-nearest, quantized inputs copied or decoded exactly)");
@@ -1155,6 +1181,63 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
     const std::int64_t k = om.k;
     if (written[mi]) continue;
     unit_start();
+    if (om.int4) {
+      // convrot_w4a4: bf16 rows (LoRA merged in fp32), then the offline W4 quantizer rotates, scales and packs them.
+      std::vector<std::uint16_t> w16(static_cast<std::size_t>(om.n * k));
+      std::vector<std::byte> bias_bytes;
+      std::int64_t row0 = 0;
+      for (const QuantLinear* p : om.parts) {
+        const auto lf = loras.find(p->name);
+        const std::vector<LoraFactor>* lfs = lf == loras.end() ? nullptr : &lf->second;
+        if (lfs) {
+          lora_used.insert(p->name);
+          ++stats.lora_modules;
+        }
+        const std::vector<std::byte> src = readers.read(p->weight);
+        note_source(p->name + ".weight", src);
+        const auto* w16src = reinterpret_cast<const std::uint16_t*>(src.data());
+        const std::uint32_t gtype = p->encoding == Encoding::kGguf ? model.gguf_types.at(p->weight.name) : 0;
+        const std::uint64_t row_bytes = p->weight.nbytes / static_cast<std::uint64_t>(p->n);
+        std::atomic<bool> bad{false};
+        parallel_for(p->n, threads, [&](std::int64_t b, std::int64_t e) {
+          std::vector<float> rows(static_cast<std::size_t>(kBatch * k));
+          std::vector<double> acc(lfs ? static_cast<std::size_t>(k) : 0);
+          for (std::int64_t r0 = b; r0 < e; r0 += kBatch) {
+            const std::int64_t nb = std::min(kBatch, e - r0);
+            if (p->encoding == Encoding::kGguf) {
+              weights::dequantize_gguf_rows(gtype, src.data() + static_cast<std::uint64_t>(r0) * row_bytes, nb, k, rows.data());
+            } else {
+              for (std::int64_t i = 0; i < nb * k; ++i) rows[static_cast<std::size_t>(i)] = bf16_to_float(w16src[r0 * k + i]);
+            }
+            if (lfs) {
+              for (std::int64_t r = 0; r < nb; ++r) {
+                for (const LoraFactor& f : *lfs) lora_merge_row(rows.data() + r * k, k, f.up.data() + (r0 + r) * f.rank, f.down.data(), f.rank, f.coef, acc.data());
+              }
+            }
+            if (!to_bf16_finite(rows.data(), static_cast<std::size_t>(nb * k), w16.data() + (row0 + r0) * k)) bad = true;
+          }
+        });
+        if (bad) fail("'" + p->name + "' holds non-finite weights" + (lfs ? " after the LoRA merge" : ""));
+        if (p->bias) {
+          const std::vector<std::byte> b = readers.read(*p->bias);
+          note_source(p->name + ".bias", b);
+          bias_bytes.insert(bias_bytes.end(), b.begin(), b.end());
+        }
+        row0 += p->n;
+      }
+      ConvRotW4A4Options w4;
+      w4.search = options.w4_search;
+      w4.threads = threads;
+      const ConvRotW4A4Weight out = quantize_convrot_w4a4(w16.data(), om.n, k, w4);
+      writer.write(tensors[om.weight], out.q.data(), out.q.size());
+      writer.write(tensors[om.scale], out.scale.data(), out.scale.size() * sizeof(float));
+      if (om.bias != kNone) writer.write(tensors[om.bias], bias_bytes.data(), bias_bytes.size());
+      stats.quantized += static_cast<int>(om.parts.size());
+      written[mi] = 1;
+      if (++done % 24 == 0) log("  " + std::to_string(done) + "/" + std::to_string(mods.size()) + " GEMMs");
+      unit_done();
+      continue;
+    }
     if (om.spec.format == QuantFormat::kNvfp4) {
       write_nvfp4(mi, quantize_nvfp4_module(om, module_f32(om), nullptr));
       continue;

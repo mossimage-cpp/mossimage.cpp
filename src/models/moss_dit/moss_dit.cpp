@@ -447,6 +447,16 @@ void MossDit::remerge_into(const lora::PristineWeights& pristine, const lora::Lo
 
 namespace {
 std::atomic<bool> g_host_merges{false};
+
+// sm_7x: the resident bf16 linears were converted to fp16 at load (after the load's merges, which run in bf16). A
+// re-merge writes bf16 bits into a device-resident target again (its MergeTarget keeps the load's kBF16 view), so they
+// are converted back in place. Streamed blocks merge into their pinned host copy, which stays bf16 and is converted on
+// every refill (BlockWeights::Pass::acquire), and INT8 targets are never converted.
+void refresh_fp16(const Tensor& w) {
+  if (!kernels::sm75::fp16_weights() || w.data == nullptr || w.device != Device::kCUDA) return;
+  if (w.dtype != DType::kBF16) return;
+  kernels::sm75::convert_bf16_to_f16(w.data, w.data, w.numel(), nullptr);
+}
 }  // namespace
 
 void MossDit::set_host_merges_for_tests(bool host) { g_host_merges.store(host); }
@@ -504,6 +514,13 @@ bool MossDit::rebase_merges(const lora::LoraStack* stack, const std::string& mem
     if (t.w.data == nullptr) return false;  // a block module: only a load can merge it
     added.emplace_back(module, t);
   }
+  // sm_7x: a module with no pristine copy yet would take it from its resident weight, which already holds the load's
+  // fp16 conversion: only a load can merge it. One the memo kept a copy of merges from that copy.
+  if (kernels::sm75::fp16_weights()) {
+    for (const auto& [module, t] : added) {
+      if (!pristine_ || !pristine_->has(module)) return false;
+    }
+  }
   MI_CUDA_CHECK(cudaDeviceSynchronize());  // no forward may read the weights while they change
   // Transactional: the pristine copies of the new modules and every module's new bits are computed into owned host
   // buffers first; a failure there (a non-finite merge, a bad factor, out of memory) drops the new copies and leaves the
@@ -549,7 +566,11 @@ bool MossDit::rebase_merges(const lora::LoraStack* stack, const std::string& mem
     for (const std::string& module : new_copies) pristine_->drop(module);
     throw;
   }
-  for (const MergeStaging& st : staged) st.store();
+  for (std::size_t i = 0; i < staged.size(); ++i) {  // staged[i] is all[i]'s
+    staged[i].store();
+    refresh_fp16(all[i].second.w);
+  }
+  if (kernels::sm75::fp16_weights()) MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
   if (!memo_key.empty() && !memo_hit) {
     // The new stack's merged bits, when they and their pristine copies fit the cap (a stack merging more is merged again
     // when it comes back).
@@ -617,11 +638,16 @@ void MossDit::remerge_lora(const lora::LoraStack& stack) {
       // The pristine bits back into the target, then the merge on the GPU.
       pristine_->restore_bf16(module, staging.w<std::uint16_t>(), staging.bias());
       staging.store();
-      if (merge_on_device(stack, module, t)) continue;
+      if (merge_on_device(stack, module, t)) {
+        refresh_fp16(t.w);
+        continue;
+      }
     }
     remerge_into(*pristine_, stack, module, t, staging);
     staging.store();
+    refresh_fp16(t.w);
   }
+  if (kernels::sm75::fp16_weights()) MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
 
 std::size_t MossDit::pristine_bytes(const lora::LoraStack& stack, const quant::QuantIndex* quant) {

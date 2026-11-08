@@ -47,6 +47,7 @@
 
 #include "util/regular_file.h"
 #include "weights/quant/nvfp4_recipes.h"
+#include "weights/quant/convrot_w4a4.h"
 #include "weights/quant/quant_model.h"
 
 // mi::quant rather than mi::weights: the format is shared by the reader, the converter and the GEMM kernels.
@@ -120,6 +121,16 @@ struct LoraInput {
 
 struct ConvertOptions {
   int group = 256;               // ConvRot group of newly quantized GEMMs
+  // convrot_w4a4 output (`--format int4`): block GEMMs become packed 4-bit weights ([N, K/2], even column the low
+  // nibble, values -7..7) with a per-row f32 scale, rotated per 256 columns (the Turbo tier's file format; its
+  // activation quant group is 64). Described by a file-level `_quantization_metadata`; no per-tensor comfy_quant is
+  // written. `group` is fixed at 256 (the rotation width); keep_bf16, LoRA merging and the other options work as for
+  // int8. Needs K divisible by 256.
+  bool int4 = false;
+  // The clipping-ratio search of the format's reference implementation (comfy-kitchen): a published file's weights
+  // match this at cosine 0.9993 (the codes differ only by the rotation GEMM's rounding). --recipe rtn skips the search
+  // (absmax), which is faster to produce and slightly worse.
+  W4ScaleSearch w4_search = W4ScaleSearch::kMse;  // --recipe mse (default) or rtn
   bool fuse_qkv = false;         // write layers.N.proj.qkv instead of proj.q/k/v
   // Also write layers.N.comfy_attention.config (a ComfyUI runtime preference, not part of the weight format) so the
   // output is byte-identical to Comfy-Org's files. Off by default; files load in ComfyUI either way.

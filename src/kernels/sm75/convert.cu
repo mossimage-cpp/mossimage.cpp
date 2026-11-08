@@ -16,6 +16,8 @@
 namespace mi::kernels::sm75 {
 namespace {
 
+bool aligned(const void* p, std::uintptr_t a) { return reinterpret_cast<std::uintptr_t>(p) % a == 0; }
+
 constexpr int kThreads = 256;
 constexpr int kMaxBlocks = 65535;
 constexpr float kF16Max = 65504.f;
@@ -107,13 +109,19 @@ namespace {
 // is skipped by the max and carried through either way).
 __global__ void bf16_to_f16_rows_scaled(const __nv_bfloat16* __restrict__ src, __half* __restrict__ dst,
                                         float* __restrict__ inv_scale, std::int64_t cols, std::int64_t src_stride,
-                                        std::int64_t dst_stride) {
+                                        std::int64_t dst_stride, std::int64_t pair_cols) {
   __shared__ float warp_max[kThreads / 32];
   __shared__ float row_scale;
   const __nv_bfloat16* s = src + static_cast<std::int64_t>(blockIdx.x) * src_stride;
   __half* d = dst + static_cast<std::int64_t>(blockIdx.x) * dst_stride;
   float amax = 0.f;
-  for (std::int64_t i = threadIdx.x; i < cols; i += blockDim.x) amax = fmaxf(amax, fabsf(__bfloat162float(s[i])));
+  // Pairs over [0, pair_cols) (0 when the rows are not 4-byte aligned), then one column per thread for the rest.
+  const std::int64_t tid = threadIdx.x, threads = blockDim.x;
+  for (std::int64_t i = 2 * tid; i < pair_cols; i += 2 * threads) {
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s + i));
+    amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+  }
+  for (std::int64_t i = pair_cols + tid; i < cols; i += threads) amax = fmaxf(amax, fabsf(__bfloat162float(s[i])));
   for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
   if (threadIdx.x % 32 == 0) warp_max[threadIdx.x / 32] = amax;
   __syncthreads();
@@ -128,36 +136,61 @@ __global__ void bf16_to_f16_rows_scaled(const __nv_bfloat16* __restrict__ src, _
   }
   __syncthreads();
   const float scale = row_scale;
-  for (std::int64_t i = threadIdx.x; i < cols; i += blockDim.x) d[i] = __float2half_rn(__bfloat162float(s[i]) * scale);
+  for (std::int64_t j = 2 * tid; j < pair_cols; j += 2 * threads) {
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s + j));
+    *reinterpret_cast<__half2*>(d + j) = __floats2half2_rn(f.x * scale, f.y * scale);
+  }
+  for (std::int64_t j = pair_cols + tid; j < cols; j += threads) d[j] = __float2half_rn(__bfloat162float(s[j]) * scale);
 }
-
 // out[r][c] = out_type(acc[r][c] * inv_scale[r] + bias[c]): the fp32 add before the single final rounding.
 template <typename Out, typename Bias>
 __global__ void gemm_out_f32(const float* __restrict__ acc, const float* __restrict__ inv_scale, Out* __restrict__ out,
                              const Bias* __restrict__ bias, std::int64_t cols, std::int64_t out_stride,
-                             std::int64_t acc_stride) {
+                             std::int64_t acc_stride, std::int64_t vec_cols) {
   const float* a = acc + static_cast<std::int64_t>(blockIdx.x) * acc_stride;
   Out* o = out + static_cast<std::int64_t>(blockIdx.x) * out_stride;
   const float sc = inv_scale[blockIdx.x];
-  for (std::int64_t c = threadIdx.x; c < cols; c += blockDim.x) {
-    float v = a[c] * sc;
-    if (bias != nullptr) v += static_cast<float>(bias[c]);
-    if constexpr (std::is_same_v<Out, float>) {
+  if constexpr (std::is_same_v<Out, float>) {
+    for (std::int64_t c = threadIdx.x; c < cols; c += blockDim.x) {
+      float v = a[c] * sc;
+      if (bias != nullptr) v += static_cast<float>(bias[c]);
       o[c] = v;
-    } else {
+    }
+  } else {
+    // Four columns per iteration over [0, vec_cols) (0 when the rows are not aligned for it): one float4 accumulator
+    // load and two packed bf16 stores. Then one column per thread for the rest.
+    const std::int64_t tid = threadIdx.x, threads = blockDim.x;
+    for (std::int64_t c = 4 * tid; c < vec_cols; c += 4 * threads) {
+      const float4 a4 = *reinterpret_cast<const float4*>(a + c);
+      float v0 = a4.x * sc, v1 = a4.y * sc, v2 = a4.z * sc, v3 = a4.w * sc;
+      if (bias != nullptr) {
+        const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(bias + c));
+        const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(bias + c + 2));
+        v0 += b01.x;
+        v1 += b01.y;
+        v2 += b23.x;
+        v3 += b23.y;
+      }
+      *reinterpret_cast<__nv_bfloat162*>(o + c) = __floats2bfloat162_rn(v0, v1);
+      *reinterpret_cast<__nv_bfloat162*>(o + c + 2) = __floats2bfloat162_rn(v2, v3);
+    }
+    for (std::int64_t c = vec_cols + tid; c < cols; c += threads) {
+      float v = a[c] * sc;
+      if (bias != nullptr) v += static_cast<float>(bias[c]);
       o[c] = __float2bfloat16_rn(v);
     }
   }
 }
-
 }  // namespace
 
 void convert_rows_bf16_to_f16_scaled(void* dst, float* inv_scale, const void* src, std::int64_t rows,
                                      std::int64_t cols, std::int64_t src_stride, std::int64_t dst_stride,
                                      cudaStream_t stream) {
   if (rows <= 0 || cols <= 0) return;
+  const bool pairs = aligned(src, 4) && aligned(dst, 4) && src_stride % 2 == 0 && dst_stride % 2 == 0;
   bf16_to_f16_rows_scaled<<<static_cast<int>(rows), kThreads, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(src), static_cast<__half*>(dst), inv_scale, cols, src_stride, dst_stride);
+      static_cast<const __nv_bfloat16*>(src), static_cast<__half*>(dst), inv_scale, cols, src_stride, dst_stride,
+      pairs ? cols & ~std::int64_t{1} : 0);
   MI_CUDA_CHECK_LAUNCH();
 }
 
@@ -169,11 +202,13 @@ void convert_gemm_out_f32(void* out, bool out_f32, const float* acc, const float
   if (out_f32) {
     gemm_out_f32<float, float><<<grid, kThreads, 0, stream>>>(acc, inv_scale, static_cast<float*>(out),
                                                               static_cast<const float*>(bias), cols, out_stride,
-                                                              acc_stride);
+                                                              acc_stride, 0);
   } else {
+    const bool vec = aligned(acc, 16) && acc_stride % 4 == 0 && aligned(out, 4) && out_stride % 2 == 0 &&
+                     (bias == nullptr || aligned(bias, 4));
     gemm_out_f32<__nv_bfloat16, __nv_bfloat16><<<grid, kThreads, 0, stream>>>(
         acc, inv_scale, static_cast<__nv_bfloat16*>(out), static_cast<const __nv_bfloat16*>(bias), cols, out_stride,
-        acc_stride);
+        acc_stride, vec ? cols & ~std::int64_t{3} : 0);
   }
   MI_CUDA_CHECK_LAUNCH();
 }

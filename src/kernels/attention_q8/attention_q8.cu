@@ -1,4 +1,6 @@
 #include "kernels/attention_q8/attention_q8.h"
+#include "kernels/sm70/sm70.h"
+#include "kernels/sm75/sm75.h"
 
 #include <algorithm>
 #include <array>
@@ -165,7 +167,15 @@ double e4m3_rn(double x) {
 
 }  // namespace
 
+namespace {
+// Turing (cc 7.5) has its own INT8-QK kernel (kernels/sm75/attention_q8_sm75.cu) for the fp16-accumulation variants.
+// Built for 75-real only (its m8n8k16 INT8 and m16n8k8 MMA need sm_75): Volta, which also runs the sm_75 family's
+// other dispatchers, has none.
+bool turing_q8_kernel() { return kernels::sm75::turing() && !kernels::sm70::volta(); }
+}  // namespace
+
 bool supported(Variant v) {
+  if (turing_q8_kernel()) return v == Variant::kInt8Fp16 || v == Variant::kInt8Fp16F32Acc;
   int device = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
   return support(device, v) == Support::kOk;
@@ -195,12 +205,23 @@ float effective_v_range(const Options& o) {
 
 std::size_t attention_q8_workspace_bytes(const Options& o, std::int64_t total_q, std::int64_t total_k, int batch,
                                          int max_seqlen, int num_heads, int num_kv_heads) {
+  if (turing_q8_kernel()) return kernels::sm75::q8_workspace_bytes(total_q, total_k, num_heads, num_kv_heads);
   return layout(o.variant, total_q, total_k, batch, max_seqlen, num_heads, num_kv_heads).total;
 }
 
 void attention_q8(const Options& o, const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out,
                   const Tensor& cu_seqlens_q, const Tensor& cu_seqlens_k, int max_seqlen, float scale, void* workspace,
                   std::size_t workspace_bytes, cudaStream_t stream, const QkNormRope* norm_rope) {
+  const bool turing = turing_q8_kernel();
+  if (turing) {
+    if (o.variant != Variant::kInt8Fp16 && o.variant != Variant::kInt8Fp16F32Acc) {
+      throw std::runtime_error("attention_q8: the sm_75 build runs the fp16-accumulation variants only");
+    }
+    if (norm_rope != nullptr) {
+      throw std::invalid_argument(
+          "attention_q8: the sm_75 build has no fused norm/rope pre-pass; run qk_norm_rope_moss first");
+    }
+  }
   check_qkvo(q, "q");
   check_qkvo(k, "k");
   check_qkvo(v, "v");
@@ -219,6 +240,16 @@ void attention_q8(const Options& o, const Tensor& q, const Tensor& k, const Tens
   require(cu_seqlens_q.dim(0) - 1 <= kMaxGridYz, "batch must be <= 65535 (grid z)");
   require(max_seqlen > 0, "max_seqlen must be positive");
   require(std::isfinite(scale) && scale > 0, "scale must be finite and positive");
+  if (turing) {  // the same operand contract as the sm_80 kernels; its own workspace layout
+    const std::size_t need = kernels::sm75::q8_workspace_bytes(total_q, total_k, static_cast<int>(heads),
+                                                               static_cast<int>(kv_heads));
+    require(total_q == 0 || (workspace != nullptr && reinterpret_cast<std::uintptr_t>(workspace) % kAlign == 0 &&
+                             workspace_bytes >= need),
+            "workspace too small or not 256-byte aligned (need " + std::to_string(need) + " bytes)");
+    kernels::sm75::q8_flash_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, scale, workspace, workspace_bytes,
+                                stream);
+    return;
+  }
   if (norm_rope != nullptr) {
     const auto vec128 = [](const Tensor& t) {
       return t.dtype == DType::kBF16 && t.device == Device::kCUDA && t.rank == 1 && t.dim(0) == kHeadDim &&

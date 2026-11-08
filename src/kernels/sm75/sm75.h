@@ -69,6 +69,10 @@ void vae_conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const Tens
                 cudaStream_t stream);
 // Mid-block attention: o = softmax(q k^T * scale) v, fp32, one head, [B, L, D] with D a multiple of 32 and any row
 // stride (>= D) for q/k/v; o is contiguous.
+// Stride-2 3x3 downsample conv (VAE encoder's Downsample2D): y [N,P,Q,K] = bias + conv(x, w) over the window at
+// (2i, 2j), x zero outside [0,H) x [0,W); R must be 3.
+void vae_conv2d_down(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor& y, cudaStream_t stream);
+
 void vae_attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& o, float scale,
                         cudaStream_t stream);
 // torch conv weight [K,C,R,S] fp32 -> [K,R,S,C] in dst's dtype (kF32 or kBF16).
@@ -82,4 +86,11 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
                const Tensor& cu_seqlens_k, int max_seqlen, bool causal, float scale, void* workspace,
                std::size_t workspace_bytes, cudaStream_t stream);
 
+// 8-bit attention (`q8_fp16`/`q8_fp16_f32acc`), the sm_75 counterpart of attention_q8::attention_q8's fp16 variants:
+// head_dim 128, non-causal, varlen/GQA; q and k are quantized per row (int8) and v becomes fp16 (attention_q8_sm75.cu,
+// Turing's m8n8k16 INT8 MMA for QK^T, the exact kernel's fp16 P·V). Lossy by design, like the sm_80 variants.
+std::size_t q8_workspace_bytes(std::int64_t total_q, std::int64_t total_k, int num_heads, int num_kv_heads);
+void q8_flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out, const Tensor& cu_seqlens_q,
+                  const Tensor& cu_seqlens_k, int max_seqlen, float scale, void* workspace, std::size_t workspace_bytes,
+                  cudaStream_t stream);
 }  // namespace mi::kernels::sm75

@@ -30,9 +30,7 @@
 namespace mi::kernels::sm75 {
 namespace {
 
-constexpr int kThreads = 128;  // 4 warps
-constexpr int kWarps = 4;
-constexpr int kBM = 64;  // query rows per CTA (16 per warp)
+
 constexpr float kLog2e = 1.4426950408889634f;
 
 // m16n8k8 fp16 -> fp32 MMA. a = {row group, row group + 8} 2-half registers, b = 2-half register, d = 4 fp32.
@@ -89,16 +87,17 @@ struct Params {
   bool causal = false;
 };
 
-template <int D, int BN>
+template <int D, int BN, int WARPS>
 __global__ void attention_kernel_sm75(const Params p) {
+  constexpr int kThreads = WARPS * 32;
+  constexpr int kBM = WARPS * 16;  // 16 query rows per warp
   constexpr int kQStride = D + 8;
   constexpr int kVStride = BN + 8;
   constexpr int kSubtiles = BN / 8;
   constexpr int kDimChunks = D / 8;
 
   extern __shared__ __align__(16) char smem_raw[];
-  __half* qs = reinterpret_cast<__half*>(smem_raw);                 // [kBM][D]
-  __half* ks = qs + kBM * kQStride;                                  // [BN][D]
+  __half* ks = reinterpret_cast<__half*>(smem_raw);                  // [BN][D]
   __half* vt = ks + BN * kQStride;                                   // [D][BN]
 
   const int batch = blockIdx.y;
@@ -120,22 +119,24 @@ __global__ void attention_kernel_sm75(const Params p) {
   const int group = lane >> 2;  // 0..7: the row of the 8x8 fragment
   const int tig = lane & 3;     // 0..3: two consecutive columns per lane
 
-  // Q tile into shared memory (rows past this sequence's end are zero).
-  for (int idx = tid; idx < kBM * D; idx += kThreads) {
-    const int r = idx / D, d = idx % D;
-    qs[r * kQStride + d] = (r < rows) ? to_half(p.q[(q_start + row_base + r) * p.q_row + head * p.q_head + d])
-                                      : __float2half_rn(0.f);
-  }
-  __syncthreads();
-
-  // This warp's Q fragment: rows {warp*16 + group, +8}, dims {i*8 + 2*tig, +1}.
+  // This warp's Q fragment: rows {warp*16 + group, +8}, dims {i*8 + 2*tig, +1}, loaded straight from global memory
+  // (bf16 -> fp16). Keeping Q out of shared memory frees 17 KiB per block, so three blocks fit an SM instead of one.
   std::uint32_t qf[kDimChunks][2];
   const int r0 = warp * 16 + group;
   const int r1 = r0 + 8;
+  const std::int64_t q_head_off = static_cast<std::int64_t>(head) * p.q_head;
+  const auto load_q_pair = [&](int row, int chunk) -> std::uint32_t {
+    if (row >= rows) return 0u;
+    const __nv_bfloat16* s =
+        p.q + static_cast<std::int64_t>(q_start + row_base + row) * p.q_row + q_head_off + chunk * 8 + tig * 2;
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s));
+    const __half2 h = __floats2half2_rn(f.x, f.y);
+    return *reinterpret_cast<const std::uint32_t*>(&h);
+  };
 #pragma unroll
   for (int i = 0; i < kDimChunks; ++i) {
-    qf[i][0] = load_u32(&qs[r0 * kQStride + i * 8 + tig * 2]);
-    qf[i][1] = load_u32(&qs[r1 * kQStride + i * 8 + tig * 2]);
+    qf[i][0] = load_q_pair(r0, i);
+    qf[i][1] = load_q_pair(r1, i);
   }
 
   float o[kDimChunks][4];  // P·V accumulators, 4 floats per 8-dim chunk
@@ -272,13 +273,15 @@ __global__ void attention_kernel_sm75(const Params p) {
   }
 }
 
-template <int D, int BN>
+template <int D, int BN, int WARPS>
 void launch(const Params& p, int max_seqlen, int batch, cudaStream_t stream) {
+  constexpr int kThreads = WARPS * 32;
+  constexpr int kBM = WARPS * 16;
   constexpr int kQStride = D + 8;
   constexpr int kVStride = BN + 8;
-  constexpr int kSmem = (kBM * kQStride + BN * kQStride + D * kVStride) * static_cast<int>(sizeof(__half));
+  constexpr int kSmem = (BN * kQStride + D * kVStride) * static_cast<int>(sizeof(__half));
   static_assert(kSmem <= 64 * 1024, "sm_75 allows 64 KiB of opt-in shared memory per block");
-  auto kernel = &attention_kernel_sm75<D, BN>;
+  auto kernel = &attention_kernel_sm75<D, BN, WARPS>;
   if constexpr (kSmem > 48 * 1024) {
     MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
   }
@@ -334,9 +337,9 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   const int batch = static_cast<int>(cu_seqlens_q.dim(0) - 1);
 
   if (head_dim == 128) {
-    launch<128, 32>(p, max_seqlen, batch, stream);
+    launch<128, 32, 4>(p, max_seqlen, batch, stream);
   } else {
-    launch<256, 16>(p, max_seqlen, batch, stream);
+    launch<256, 16, 8>(p, max_seqlen, batch, stream);
   }
 }
 

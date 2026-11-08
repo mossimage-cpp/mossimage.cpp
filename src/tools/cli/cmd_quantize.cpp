@@ -27,16 +27,18 @@ constexpr const char* kUsage =
     "usage: moss-infer quantize <transformer_dir|bundle_dir|dit.safetensors|dit.gguf> -o <out.safetensors>\n"
     "         [--fuse-qkv] [--keep-bf16 <pattern,...>] [--lora <file> [--lora-scale <s>]]... [--group <G>]\n"
     "         [--comfy-attention-config] [--threads <n>]\n"
-    "         [--format int8|nvfp4] [--recipe rtn|mse|gptq|gptq-mse] [--keep <preset|units>] [--calib-model <bundle_dir>]\n"
+    "         [--format int8|int4|nvfp4] [--recipe rtn|mse|gptq|gptq-mse] [--keep <preset|units>] [--calib-model <bundle_dir>]\n"
     "  --keep-bf16    comma-separated globs over GEMM names, e.g. 'layers.*.proj.ffn_down,layers.0.*'\n"
     "  --lora         kohya (diffusion_model.<m>.lora_{down,up}.weight + alpha), PEFT (lora_A/lora_B) or moss-edit-lora\n"
     "                 (bare <m>.lora_A / .lora_B, alphas in adapter_config) LoRA,\n"
     "                 merged in fp32 before quantizing; --lora-scale applies to the preceding --lora (default 1)\n"
     "  --group        ConvRot group of newly quantized GEMMs: 4, 16, 64, 256 (default) or 1024\n"
     "  --threads      CPU threads, 0 = all cores (default)\n"
-    "  --format       int8 (default): INT8 ConvRot; nvfp4: NVFP4 block GEMMs (RTX 50), the --keep units INT8 ConvRot,\n"
+    "  --format       int8 (default): INT8 ConvRot; int4: ConvRot W4A4 (the Turbo tier's convrot_w4a4 file,\n"
+    "                 4-bit weights + per-row scale, rotated per 256 columns); nvfp4: NVFP4 block GEMMs (RTX 50),\n"
     "                 q/k/v fused, from bf16 weights\n"
-    "  --recipe       nvfp4 weights: gptq-mse (default), gptq, mse or rtn (bit-exact to comfy-kitchen); gptq*\n"
+    "  --recipe       int4 weights: mse (default, the format's clipping-ratio search) or rtn (absmax, faster);\n"
+    "                 nvfp4 weights: gptq-mse (default), gptq, mse or rtn (bit-exact to comfy-kitchen); gptq*\n"
     "                 capture calibration Hessians with the engine on the GPU (3 built-in prompts)\n"
     "  --keep         units kept INT8: g0.9 (default, 42 units), g0.95 (21), none, or e.g. 'b37.down,b26.o'\n"
     "  --calib-model  the bundle (tokenizer, text encoder) gptq* calibrate with; default: the input's bundle when the\n"
@@ -97,7 +99,7 @@ int cmd_quantize(const std::vector<std::string>& args) {
     const bool has_value = i + 1 < args.size();
     if (a == "--format" && has_value) {
       format = args[++i];
-      if (format != "int8" && format != "nvfp4") return bad_value(a, format, "int8 or nvfp4");
+      if (format != "int8" && format != "int4" && format != "nvfp4") return bad_value(a, format, "int8, int4 or nvfp4");
     } else if (a == "--recipe" && has_value) {
       recipe_arg = args[++i];
       if (!quant::parse_nvfp4_recipe(recipe_arg)) return bad_value(a, recipe_arg, "rtn, mse, gptq or gptq-mse");
@@ -143,9 +145,23 @@ int cmd_quantize(const std::vector<std::string>& args) {
     std::cerr << kUsage;
     return 2;
   }
-  if (format != "nvfp4" && (!recipe_arg.empty() || !keep_arg.empty() || !calib_model.empty() || !hessians_out.empty() || !hessians_in.empty())) {
-    std::cerr << "moss-infer quantize: --recipe, --keep, --calib-model and --hessians[-out] need --format nvfp4\n" << kUsage;
+  if (format == "int8" && (!recipe_arg.empty() || !keep_arg.empty() || !calib_model.empty() || !hessians_out.empty() || !hessians_in.empty())) {
+    std::cerr << "moss-infer quantize: --recipe, --keep, --calib-model and --hessians[-out] need --format nvfp4 or int4\n" << kUsage;
     return 2;
+  }
+  if (format == "int4") {
+    options.int4 = true;
+    if (!recipe_arg.empty()) {
+      if (recipe_arg != "rtn" && recipe_arg != "mse") {
+        std::cerr << "moss-infer quantize: --format int4 takes --recipe rtn or mse\n" << kUsage;
+        return 2;
+      }
+      options.w4_search = recipe_arg == "mse" ? quant::W4ScaleSearch::kMse : quant::W4ScaleSearch::kAbsmax;
+    }
+    if (keep_arg.empty() == false || !calib_model.empty() || !hessians_out.empty() || !hessians_in.empty()) {
+      std::cerr << "moss-infer quantize: --keep, --calib-model and --hessians[-out] need --format nvfp4\n" << kUsage;
+      return 2;
+    }
   }
   if (format == "nvfp4") {
     quant::Nvfp4Options fp4;

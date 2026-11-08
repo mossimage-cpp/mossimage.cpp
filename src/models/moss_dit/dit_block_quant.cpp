@@ -9,6 +9,7 @@
 
 #include "kernels/attention/flash_attention.h"
 #include "kernels/attention_q8/attention_q8.h"
+#include "kernels/sm75/sm75.h"
 #include "kernels/basic/elementwise.h"
 #include "kernels/basic/norm.h"
 #include "kernels/fused/fused_gemm.h"
@@ -429,8 +430,10 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   // cu_seqlens_q == cu_seqlens_k and nothing reads the normed k first: no reference slots (kv is then the slotted
   // region, with cu_seqlens_k) and no K/V tap (it copies the normed, roped k). Otherwise qk_norm_rope_moss runs before
   // the tap and attention_q8 gets no norm_rope.
+  // sm_75's 8-bit attention has no fused norm/rope pre-pass (its own pre-pass quantizes rows); the separate
+  // qk_norm_rope_moss below gives the same bits, so keep it there.
   const bool fused_norm_rope = attention != AttentionMode::kExact && slots == 0 && run.kv_tap == nullptr &&
-                               m >= kFusedNormRopeMinTokens;
+                               m >= kFusedNormRopeMinTokens && !kernels::sm75::turing();
   if (!fused_norm_rope) kernels::fused::qk_norm_rope_moss(qkv, static_cast<int>(kH), w.q_norm, w.k_norm, rope, stream);
   if (run.kv_tap != nullptr) {
     tap_reference_kv(qkv, run.kv_tap, stream);

@@ -221,6 +221,10 @@ inline void check_user_paths(const PipelineOptions& o, const Request& r) {
 // On a Volta or Turing device: throws NotSupportedError for what still needs sm_80+ kernels (pipeline.cpp). No-op elsewhere.
 void refuse_unsupported_on_sm7x(const Request& req);
 
+// On a Volta or Turing device, runtime LoRAs are merged into the weights at load: the side branches are fused into
+// sm_80+ CUTLASS GEMMs. Sets req.lora_placement to kMerge there (Pipeline::run and every Session run); no-op elsewhere.
+void force_lora_merge_on_sm7x(Request& req);
+
 inline moss_dit::SkipSet skip_set(const std::vector<int>& layers) {
   moss_dit::SkipSet s;
   for (const int l : layers) s.set(static_cast<std::size_t>(l));

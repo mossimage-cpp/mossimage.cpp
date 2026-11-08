@@ -928,7 +928,7 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
     return d;
   }
   // High and Turbo: the tier's default attention (kTierAttention) unless the caller gave one; never a silent fallback
-  // (exact_when_no_q8 makes the absence explicit in the reason instead: sm_75 has no 8-bit attention kernel).
+  // (exact_when_no_q8 makes the absence explicit in the reason instead: sm_7x has no default 8-bit attention kernel).
   const char* const tier = requested == Tier::kTurbo ? "turbo" : "high";
   if (attention) {
     d.attention = *attention;
@@ -952,7 +952,7 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
   d.reason = std::string(requested == Tier::kTurbo ? "Turbo tier" : "High tier") + ": " + weights + ", " +
              attention_name(d.attention) + " attention" +
              (exact_when_no_q8 && !attention && d.attention == AttentionMode::kExact
-                  ? " (no 8-bit attention kernel on this device)"
+                  ? " (no default 8-bit attention kernel on this device)"
                   : "");
   return d;
 }

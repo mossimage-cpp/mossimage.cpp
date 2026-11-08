@@ -131,8 +131,8 @@ inline constexpr AttentionMode kTierAttention[] = {AttentionMode::kQ8Fp8, Attent
 // Throws std::invalid_argument (naming the conflict) for a refused combination. An empty `supported` runs every kernel.
 // te_quantized: the text encoder is an INT8 / W4A8 file, a lossy dimension as an INT8 DiT is (reference refused; the
 // exact-attention configuration is a High-tier one). nvfp4_native: the NVFP4 GEMMs run here (Capabilities::nvfp4_native).
-// exact_when_no_q8: the device has no 8-bit attention kernel (sm_75), so an unset `attention` resolves to exact with a
-// reason instead of refusing the tier (the default would otherwise be a silent, absent fallback).
+// exact_when_no_q8: the device has no default 8-bit attention kernel (sm_7x), so an unset `attention` resolves to exact
+// with a reason instead of refusing the tier (the default would otherwise be a silent, absent fallback).
 TierDecision resolve_tier(Tier tier, std::optional<AttentionMode> attention, Precision dit_precision,
                           const AttentionSupported& supported, bool te_quantized = false, bool nvfp4_native = false,
                           bool exact_when_no_q8 = false);

@@ -66,6 +66,7 @@ if((MOSSINFER_SM75 OR MOSSINFER_SM70) AND _mi_sm75_present)
       src/kernels/gdn/chunk_rule.cu
       src/kernels/gdn/conv_gates.cu
       src/kernels/lora/lora_kernels.cu
+      src/kernels/lora/lora_merge.cu
       src/kernels/quant/rotate_quantize.cu
       src/kernels/quant/w4a8_decode.cu
       src/kernels/quant4/convrot_quantize.cu

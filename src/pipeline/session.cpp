@@ -139,6 +139,7 @@ Request run_request(const SessionOptions& o, const RunSpec& spec, const Guidance
   q.slg_start = spec.slg_start;
   q.slg_stop = spec.slg_stop;
   q.loras = spec.loras;
+  force_lora_merge_on_sm7x(q);  // no LoRA side branches on sm_7x
   q.control.adapter = o.control_adapter;
   q.control.lora_strength = spec.control_lora_strength;
   q.control.images = spec.control_images;
@@ -379,6 +380,7 @@ Session::Session(Pipeline& pipeline, JobGate& gate, SessionOptions options) {
   q.control.adapter = options.control_adapter;
   if (q.control.adapter.empty()) q.control.images.clear();
   if (tok::python_strip(q.prompt).empty()) q.prompt = "preload";
+  force_lora_merge_on_sm7x(q);  // the plan's models match the runs' (run_request)
   check_user_paths(pipeline.impl_->options, q);
   pipeline::validate(q);
   refuse_unsupported_on_sm7x(q);

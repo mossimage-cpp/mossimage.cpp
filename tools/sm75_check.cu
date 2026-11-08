@@ -526,6 +526,53 @@ int run_int8_gemm(int M, int N, int K) {
 
 }  // namespace
 
+// Times the sm_75 exact attention at engine shapes: one sequence, `len` tokens, `iters` launches, CUDA events.
+int run_attn_bench(const char* name, int heads, int kv_heads, int dim, bool causal, int len, int iters) {
+  const auto q = normal(static_cast<std::size_t>(len) * heads * dim, 71, 1.f);
+  const auto k = normal(static_cast<std::size_t>(len) * kv_heads * dim, 72, 1.f);
+  const auto v = normal(static_cast<std::size_t>(len) * kv_heads * dim, 73, 1.f);
+  std::vector<std::uint16_t> qb(q.size()), kb(k.size()), vb(v.size());
+  for (std::size_t i = 0; i < q.size(); ++i) qb[i] = float_to_bf16_bits(q[i]);
+  for (std::size_t i = 0; i < k.size(); ++i) kb[i] = float_to_bf16_bits(k[i]);
+  for (std::size_t i = 0; i < v.size(); ++i) vb[i] = float_to_bf16_bits(v[i]);
+  DevBuf dq(qb.size() * 2), dk(kb.size() * 2), dv(vb.size() * 2), dout(qb.size() * 2), dcu(2 * sizeof(int));
+  dq.upload(qb);
+  dk.upload(kb);
+  dv.upload(vb);
+  const std::vector<int> cu{0, len};
+  dcu.upload(cu);
+  MI_CUDA_CHECK(cudaMemset(dout.get(), 0, qb.size() * 2));
+  auto t = [](void* ptr, DType dt, std::initializer_list<std::int64_t> shape) {
+    return Tensor::view(ptr, dt, Device::kCUDA, shape);
+  };
+  const Tensor tq = t(dq.get(), DType::kBF16, {len, heads, dim});
+  const Tensor tk = t(dk.get(), DType::kBF16, {len, kv_heads, dim});
+  const Tensor tv = t(dv.get(), DType::kBF16, {len, kv_heads, dim});
+  const Tensor to = t(dout.get(), DType::kBF16, {len, heads, dim});
+  const Tensor tcu = t(dcu.get(), DType::kI32, {2});
+  const float scale = 1.f / std::sqrt(static_cast<float>(dim));
+  const std::size_t ws_bytes = static_cast<std::size_t>(len) * heads * sizeof(float);
+  DevBuf dls(ws_bytes);
+  MI_CUDA_CHECK(cudaMemset(dls.get(), 0, ws_bytes));
+  mi::kernels::sm75::flash_fwd(tq, tk, tv, to, tcu, tcu, len, causal, scale, dls.get(), ws_bytes, nullptr);
+  MI_CUDA_CHECK(cudaDeviceSynchronize());
+  cudaEvent_t start, stop;
+  MI_CUDA_CHECK(cudaEventCreate(&start));
+  MI_CUDA_CHECK(cudaEventCreate(&stop));
+  MI_CUDA_CHECK(cudaEventRecord(start));
+  for (int i = 0; i < iters; ++i) mi::kernels::sm75::flash_fwd(tq, tk, tv, to, tcu, tcu, len, causal, scale, dls.get(), ws_bytes, nullptr);
+  MI_CUDA_CHECK(cudaEventRecord(stop));
+  MI_CUDA_CHECK(cudaEventSynchronize(stop));
+  float ms = 0.f;
+  MI_CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+  const double seconds = ms / 1000.0 / iters;
+  const double flops = (causal ? 0.5 : 1.0) * 2.0 * len * len * dim * heads;
+  std::printf("attn_bench %-8s L %5d heads %2d kv %2d dim %3d causal %d: %8.3f ms  %7.1f TFLOPS\n", name, len, heads,
+              kv_heads, dim, causal ? 1 : 0, seconds * 1e3, flops / seconds / 1e12);
+  MI_CUDA_CHECK(cudaEventDestroy(start));
+  MI_CUDA_CHECK(cudaEventDestroy(stop));
+  return 0;
+}
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const std::string what = argc > 1 ? argv[1] : "all";
@@ -584,7 +631,11 @@ int main(int argc, char** argv) {
       failures += run_attention("te282", 16, 4, 256, true, {282}, 42);
       failures += run_attention("dit76", 24, 24, 128, false, {76, 200, 1}, 43);
     }
-  } catch (const std::exception& e) {
+    if (what == "bench") {
+      failures += run_attn_bench("dit256", 24, 24, 128, false, 266, 50);
+      failures += run_attn_bench("dit1024", 24, 24, 128, false, 4113, 5);
+      failures += run_attn_bench("te", 32, 8, 256, true, 4096, 5);
+    }  } catch (const std::exception& e) {
     std::printf("EXCEPTION: %s\n", e.what());
     return 2;
   } catch (...) {
