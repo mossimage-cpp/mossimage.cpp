@@ -203,14 +203,14 @@ On top of that, the weights are read through the operating system's page cache. 
 cmake --preset linux-cuda13
 cmake --build --preset linux-cuda13 -j8
 CUDA_VISIBLE_DEVICES="" ctest --preset linux-cuda13 -L '^cpu$'
-cmake --install build-linux-cuda13                # -> build-linux-cuda13/install
-cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-cuda13/install-system-cuda
-(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-2.2.0-linux-cu13-x86_64.{tar.gz,zip}
+cmake --install build/linux-cuda13                # -> build/linux-cuda13/install
+cmake --install build/linux-cuda13 --component Unspecified --prefix build/linux-cuda13/install-system-cuda
+(cd build/linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-2.2.0-linux-cu13-x86_64.{tar.gz,zip}
 ```
 
 - **glibc:** the archive needs the glibc of the machine that built it, or a newer one. Build on the oldest distribution you want to support. CI uses Ubuntu 22.04, which gives glibc 2.35. A build from a rolling distribution such as Arch will not start on Ubuntu LTS.
 - **Linux CUDA 12 with Volta:** use the `linux-cuda12-sm70` configure/build/test/package presets. This produces a `-sm70` package; CUDA 13 cannot build or run the Volta backend. See [sm70.md](sm70.md#build).
-- **Windows CUDA 13 with Turing:** from a Visual Studio x64 developer prompt, run `cmake --preset windows-msvc-cuda13-sm75`, `cmake --build --preset windows-msvc-cuda13-sm75`, `ctest --preset windows-msvc-cuda13-sm75`, then `cpack --config build-windows-msvc-cuda13-sm75/CPackConfig.cmake -B build-windows-msvc-cuda13-sm75`. This creates the full `-sm75.zip` package; the ordinary presets remain Ampere-and-newer. Any preset takes `-DMOSSINFER_SM75=ON`; what the build adds is in [sm75.md](sm75.md#build).
+- **Windows CUDA 13 with Turing:** from a Visual Studio x64 developer prompt, run `cmake --preset windows-msvc-cuda13-sm75`, `cmake --build --preset windows-msvc-cuda13-sm75`, `ctest --preset windows-msvc-cuda13-sm75`, then `cpack --config build/windows-msvc-cuda13-sm75/CPackConfig.cmake -B build/windows-msvc-cuda13-sm75`. This creates the full `-sm75.zip` package; the ordinary presets remain Ampere-and-newer. Any preset takes `-DMOSSINFER_SM75=ON`; what the build adds is in [sm75.md](sm75.md#build).
 - **Other presets:** `linux-cuda12`, `windows-msvc-cuda13` and `windows-msvc-cuda12`. The Windows presets run from a Visual Studio 2022 x64 developer prompt.
 
 ### Package contents

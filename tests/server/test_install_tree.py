@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Install-tree test of the cuBLASLt search (src/backend/cuda_libs.h). Standard library only; needs no GPU.
 
-    python3 tests/server/test_install_tree.py --build build-dev --work build-dev/install_tree_test \\
+    python3 tests/server/test_install_tree.py --build build/dev --work build/dev/install_tree_test \\
         [--check-package .github/scripts/check_package.py]
 
 Installs the build twice: the full tree (every component, cuBLASLt bundled) and the system-CUDA variant

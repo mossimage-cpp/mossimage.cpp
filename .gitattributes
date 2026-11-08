@@ -1,0 +1,12 @@
+* text=auto
+*.png binary
+*.jpg binary
+*.npy binary
+*.npz binary
+*.safetensors binary
+*.gguf binary
+*.bin binary
+third_party/** linguist-vendored
+tests/data/** linguist-generated
+tests/golden/** linguist-generated
+tests/reference_images/** linguist-generated
