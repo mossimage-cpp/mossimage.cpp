@@ -30,8 +30,10 @@ inline constexpr int kHeadDim = 128;
 inline constexpr int kFfnDim = 8192;
 
 // Key tokens per step of the online softmax. Part of the numerics: each step's weights are rounded to bf16 relative to
-// the running maximum over the steps so far. 32 is FlashAttention's hdim128 128x32 tile, which the engine runs on sm_89.
-inline constexpr int kAttentionStepN = 32;
+// the running maximum over the steps so far, so this is also a throughput knob. 128 keys/step is much faster here than
+// 32; the engine's FA2 hdim-128 tiles are 128x32 (sm_89) and 128x64, so exact-attention results are close but not
+// bit-identical to CUDA. This is a deliberate throughput choice, not the engine's tile.
+inline constexpr int kAttentionStepN = 128;
 
 // Packed operands: 16 x 16 fragments contiguous, for rows grouped in 16s and columns in 16s: element (r, c) at
 //   to[(r / 16 * (cols / 16) + c / 16) * 256 + r % 16 * 16 + c % 16]
@@ -48,14 +50,15 @@ const char* leaf_name();
 // out[rows, d] = bf16(bf16(bf16(rms_norm(x)) * w) * (1 + scale)) + shift); w, scale, shift: [d], d a multiple of 4.
 // The fp32 mean of squares is summed in the order of torch's reduce kernel for >= 16 rows (kernels/basic/norm.cu: 32
 // threads x 4 values, then a halving tree). That order is kept below 16 rows, where the engine's block width grows, so
-// outputs there are not bit-exact against the engine: about 5 in 10^6 differ at 7 to 15 rows of 3072 (hip_block_verify).
+// outputs there are not bit-exact against the engine: a few values in 10^6 differ at short row counts (see the kernel
+// checks under tools/).
 void rms_norm_modulate(const bf16_bits* x, std::int64_t ldx, const bf16_bits* weight, const bf16_bits* scale,
                        const bf16_bits* shift, bf16_bits* out, std::int64_t ldo, std::int64_t rows, int d,
                        hipStream_t stream);
 
 // out[m, n] = bf16(x[m, k] · w[n, k]ᵀ), with fp32 accumulators and K ascending.
 void gemm(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w, std::int64_t ldw,
-          int m, int n, int k, hipStream_t stream);
+          int m, int n, int k, hipStream_t stream, const bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0);
 
 // In place, per head: q and k = rope(rms_norm(.)). qkv: [tokens, >= 2 * heads * 128] with q heads then k heads;
 // q_norm, k_norm: [128]; table: [tokens, 128] RoPE rows, [sin(64) | cos(64)].
@@ -87,11 +90,11 @@ void attention(const AttentionArgs& a, hipStream_t stream);
 
 // residual[m, n] += bf16(bf16(x[m, k] · w[n, k]ᵀ) * gate[n]), read and written in place.
 void gemm_gated_residual(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w,
-                         std::int64_t ldw, const bf16_bits* gate, int m, int n, int k, hipStream_t stream);
+                         std::int64_t ldw, const bf16_bits* gate, int m, int n, int k, hipStream_t stream, const bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0);
 
 // out[m, f] = situ(bf16(x · hiddenᵀ), bf16(x · gateᵀ)) for the stored [hidden | gate] weight w_up_gate[2f, k].
 void gemm_situ_glu(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w_up_gate,
-                   std::int64_t ldw, int m, int f, int k, hipStream_t stream);
+                   std::int64_t ldw, int m, int f, int k, hipStream_t stream, const bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0);
 
 // One block's weights: norm1, norm2 [kDim]; q_norm, k_norm [128]; qkv [3 kDim, kDim]; o [kDim, kDim];
 // up_gate [2 kFfnDim, kDim]; down [kDim, kFfnDim]. All contiguous.
@@ -126,15 +129,19 @@ struct BlockBuffers {
   int max_seqlen;
   int tokens;
   // Used with packed weights. pack: [ceil(tokens / kPackRowsMultiple) * kPackRowsMultiple, kFfnDim]. pack_attn:
-  // [tokens + 32 * batch, 3 kDim].
+  // [tokens + kAttentionStepN * batch, 3 kDim].
   bf16_bits* pack = nullptr;
   bf16_bits* pack_attn = nullptr;
 };
 
+// Pack q/k/v into the fragment layout attention() expects when AttentionArgs::packed is set.
+void pack_attention(const BlockBuffers& b, hipStream_t stream);
+
 // The block's ops, in order, so a caller can time each one.
 inline constexpr int kBlockOps = 8;
 const char* block_op_name(int op);
-void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream);
+void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream,
+                  const bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0);
 void run_block(const BlockWeights& w, const BlockBuffers& b, hipStream_t stream);
 
 }  // namespace hip_block

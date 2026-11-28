@@ -1,5 +1,8 @@
 build/
 build-*/
+hip/build-win/
+hip/dist/
+*.hipfb
 __pycache__/
 *.pyc
 tests/golden/**/*.npy

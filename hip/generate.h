@@ -19,7 +19,11 @@
 namespace mi::hip {
 
 struct GenerateRequest {
-  std::filesystem::path model_dir;  // MOSS-Image directory: text_encoder/, transformer/, vae/
+  std::filesystem::path model_dir;  // MOSS-Image directory: tokenizer/ and the configs
+  // Optional single-file overrides; empty: the corresponding directory under model_dir.
+  std::filesystem::path dit_file, te_file, vae_file;
+  std::filesystem::path lora_file;  // optional LoRA safetensors applied to the DiT blocks
+  float lora_scale = 1.0f;
   std::vector<std::int32_t> cond_ids;
   std::vector<std::int32_t> uncond_ids;  // unused when cfg == 1
   std::uint32_t width = 0, height = 0;   // pixels, multiples of 16
@@ -32,7 +36,11 @@ struct GenerateRequest {
   // activations and a reserve for the code objects and the runtime. The DiT's blocks past what it leaves stream from
   // pinned host memory every step. 0: the automatic budget, what the device has free.
   std::uint64_t vram_budget = 0;
+  // Whether the DiT's blocks use the INT8 ConvRot path. The planner adds its activation scratch only then; a bf16
+  // ("reference") DiT does not allocate those buffers.
+  bool int8_dit = true;
   bool decode = true;  // false: stop at the final latents
+  bool vae_tiled = false;  // --vae-tiled: decode in tiles; MI_HIP_VAE_BAND_TILE_PX sets the band height
   // Called with the final latents before the decode.
   std::function<void(const std::vector<float>& latents)> on_latents;
   // stage: "text encoder", "denoise", "vae"; done of total within it.
@@ -43,7 +51,11 @@ struct GenerateResult {
   std::uint32_t width = 0, height = 0;
   std::vector<std::uint8_t> rgb;  // [height, width, 3]; empty without the decode
   std::vector<float> latents;     // the final latents, f32 [128, height / 16, width / 16]
-  double text_encoder_s = 0, dit_load_s = 0, denoise_s = 0, vae_s = 0;
+  double text_encoder_s = 0, text_encoder_load_s = 0, dit_load_s = 0, denoise_s = 0, vae_s = 0;
+  // Which VAE path actually ran, including the reason when tiling was used instead of a full decode.
+  enum class VaeDecodePath { kNone, kFull, kTiledRequested, kTiledBudget, kTiledFallback };
+  VaeDecodePath vae_decode_path = VaeDecodePath::kNone;
+  std::string vae_decode_note;  // the original full-decode error, when that decode failed and tiling was retried
   int dit_resident_blocks = 0;  // of 42; the rest streamed from host memory every step
   std::uint64_t dit_free_bytes = 0;  // device memory free once the DiT's weights loaded, for its activations
 };

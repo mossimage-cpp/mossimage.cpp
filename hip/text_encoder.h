@@ -13,9 +13,9 @@
 //
 // Weights stream from the safetensors files one layer at a time; the device never holds more than two layers. A reader
 // thread (with helper threads) reads layer k + 2 into one of two pinned host buffers while layer k + 1 is copied on a copy
-// stream into a device buffer and layer k computes. The packed path (the default) then packs the layer's GEMM weights
-// into pack_fragments' layout on the device; the copy of the next layer waits only for that pack. The embedding rows of
-// the ids are read from the file on the host.
+// stream into a device buffer and layer k computes. By default the projection GEMMs run on the row-major weights through
+// the LDS-staged tiled bf16 kernel; the packed path packs each layer's weights into pack_fragments' layout on the device
+// and is opt-in. The embedding rows of the ids are read from the file on the host.
 #pragma once
 
 #include <cstdint>
@@ -42,9 +42,19 @@ struct TextEncoderOptions {
   // Threads reading a layer's weights from the files (several reads in flight are what a cold NVMe drive needs).
   int reader_threads = 4;
   // GEMMs on packed operands (pack_fragments' layout); false: on the row-major operands. Both give the same bits.
+  // Consulted only when tiled_gemm is false.
   bool packed = true;
   // Device time of every op into TextEncoderStats::op_ms (events around each op).
   bool time_ops = false;
+  // Bit-exact reference Hadamard dequantization (O(g^2)) versus the fast radix-4 transform that differs from it at a
+  // small fraction of bf16 values. See tools/hip_dequant_fast_check.
+  bool exact_dequant = false;
+  // Route the projection GEMMs through the LDS-staged tiled bf16 kernel on row-major weights,
+  // dropping the per-layer weight/activation packing. Faster than the packed path, with slightly different rounding.
+  bool tiled_gemm = true;
+  // Keep the int8 ConvRot weights on the device and run the Hadamard dequantization there, instead of expanding them
+  // to a 2x host bf16 image and copying that to the device. The embedding and final norm stay on the host path.
+  bool device_dequant = true;
 };
 
 // Times of the last encode().

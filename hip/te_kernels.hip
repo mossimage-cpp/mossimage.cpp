@@ -875,7 +875,7 @@ void gemm_packed(bf16_bits* out, std::int64_t ldo, const bf16_bits* xp, const bf
   require(k % kFrag == 0, "gemm_packed", "k must be a multiple of 16");
   if (m == 0 || n == 0) return;
   const Blocking bl = blocking_of(m, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, m, n, k, bl.bm, bl.bn, xp, wp};
+  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, m, n, k, bl.bm, bl.bn, xp, wp, nullptr, 0};
   gemm_kernel<Epilogue::kPlain><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("te::gemm_packed");
 }
@@ -885,7 +885,7 @@ void gemm_packed_residual(bf16_bits* residual, std::int64_t ldr, const bf16_bits
   require(k % kFrag == 0, "gemm_packed_residual", "k must be a multiple of 16");
   if (m == 0 || n == 0) return;
   const Blocking bl = blocking_of(m, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{residual, ldr, nullptr, 0, nullptr, 0, ones, m, n, k, bl.bm, bl.bn, xp, wp};
+  const GemmArgs a{residual, ldr, nullptr, 0, nullptr, 0, ones, m, n, k, bl.bm, bl.bn, xp, wp, nullptr, 0};
   gemm_kernel<Epilogue::kGatedResidual><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("te::gemm_packed_residual");
 }

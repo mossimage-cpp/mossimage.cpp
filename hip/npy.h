@@ -23,12 +23,6 @@ struct Array {
   std::vector<std::int64_t> shape;
   std::vector<std::byte> data;  // raw element bytes, C order
 
-  std::int64_t numel() const {
-    std::int64_t n = 1;
-    for (const std::int64_t d : shape) n *= d;
-    return n;
-  }
-
   // Copies the elements out as T. Throws unless dtype is exactly T's kind and size, e.g. "f4" for float.
   template <typename T>
   std::vector<T> to_vector() const {

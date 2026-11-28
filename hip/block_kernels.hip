@@ -18,9 +18,20 @@
 #include "gemm_tile.h"
 #include "hip_block.h"
 #include "mma_leaf.h"
+#include "runtime.h"
 
 namespace hip_block {
 namespace {
+
+// RDNA3's exp2 is a single hardware instruction; the device library's exp2f lowers to a longer sequence. The ROCm
+// ComfyUI kernels gate this builtin on gfx1103, where the two were verified equivalent within their tolerance.
+__device__ __forceinline__ float hw_exp2(float x) {
+#if defined(__gfx1103__)
+  return __builtin_amdgcn_exp2f(x);
+#else
+  return exp2f(x);
+#endif
+}
 
 constexpr int kSituTileM = 48, kSituTileF = 16;  // F hidden columns and their F gate columns
 static_assert(kPackRowsMultiple % kGemmTileM == 0 && kPackRowsMultiple % kSituTileM == 0);
@@ -52,7 +63,7 @@ struct PackArgs {
 };
 __global__ __launch_bounds__(kWave) void pack_kernel(const PackArgs a) {
   const int t = thread_id(), r = t / 2, c0 = (t & 1) * 8;
-  const std::int64_t ks = blockIdx.x, group = blockIdx.y, row = group * kFrag + r;  // along the row groups: 0.9 ms at K 8192, across them 23 ms
+  const std::int64_t ks = blockIdx.x, group = blockIdx.y, row = group * kFrag + r;  // K steps along x, row groups along y
   copy_lane_of_fragment(a.to + (group * a.kg + ks) * (kFrag * kFrag) + r * kFrag + c0, a.from + row * a.ld + ks * kFrag + c0, row >= a.rows);
 }
 
@@ -131,11 +142,10 @@ struct QkArgs {
   float factor;  // torch MeanOps factor of the per-head norm
 };
 
-__global__ __launch_bounds__(kWave) void qk_norm_rope_kernel(const QkArgs a) {
+__global__ __launch_bounds__(kWave) void qk_norm_rope_kernel(const QkArgs a, std::int64_t start) {
   __shared__ float red[kWave];
-  __shared__ float norm[kHeadDim];
   const int lane = thread_id();
-  const std::int64_t item = blockIdx.x;
+  const std::int64_t item = start + static_cast<std::int64_t>(blockIdx.x);
   const std::int64_t token = item / (2 * a.heads);
   const int head = static_cast<int>(item % (2 * a.heads));  // q heads first, then k heads (columns head * 128)
   bf16_bits* row = a.qkv + token * a.ld + static_cast<std::int64_t>(head) * kHeadDim + 4 * lane;
@@ -153,16 +163,16 @@ __global__ __launch_bounds__(kWave) void qk_norm_rope_kernel(const QkArgs a) {
   HIP_BLOCK_UNROLL
   for (int i = 0; i < 4; ++i) {
     y[i] = rbf(mul(rbf(mul(x[i], r)), f(weight[i])));  // rms_norm_moss output (bf16)
-    norm[4 * lane + i] = y[i];
   }
-  leaf::barrier();
 
-  // Table row [sin(64) | cos(64)]; pair index t = dim mod 64.
+  // Table row [sin(64) | cos(64)]; pair index t = dim mod 64. The RoPE partner of lane l is lane l ^ 16: a wavefront
+  // fence is not enough to publish one lane's shared-memory write to another, so exchange the partner's value with a
+  // lane shuffle instead of reading it back from __shared__.
   const bf16_bits* tab = a.table + token * a.table_ld + 4 * (lane & 15);
   const bool lo_half = lane < 16;
   HIP_BLOCK_UNROLL
   for (int i = 0; i < 4; ++i) {
-    const float other = norm[(4 * lane + i) ^ 64];
+    const float other = __shfl_xor_sync(0xffffffffull, y[i], 16);
     const float si = f(tab[i]), co = f(tab[64 + i]);
     const float lo = lo_half ? y[i] : other, hi = lo_half ? other : y[i];
     // moss_rope_apply's rotate_pair: lo' = lo*cos + (-hi)*sin, hi' = hi*cos + lo*sin, each op rounded.
@@ -210,8 +220,12 @@ __global__ __launch_bounds__(kWave) void gemm_situ_kernel(const GemmArgs a) {
 
   for (int i = thread_id(); i < rows * cols; i += kWave) {
     const int r = i / cols, c = i % cols;
-    // The GEMM output is a bf16 tensor in the reference: round both halves before SiTU.
-    const float h = rbf(mem[r * kMemCols + c]), g = rbf(mem[r * kMemCols + kSituTileF + c]);
+    // The GEMM output is a bf16 tensor in the reference: round both halves before SiTU. A LoRA delta is folded
+    // into the fp32 accumulator first, at the same point as the INT8 epilogue.
+    const std::int64_t drow = (m0 + r) * a.ldl;
+    const float dh = a.lora_delta != nullptr ? f(a.lora_delta[drow + f0 + c]) : 0.0f;
+    const float dg = a.lora_delta != nullptr ? f(a.lora_delta[drow + a.n + f0 + c]) : 0.0f;
+    const float h = rbf(mem[r * kMemCols + c] + dh), g = rbf(mem[r * kMemCols + kSituTileF + c] + dg);
     a.out[(m0 + r) * a.ldo + f0 + c] = bf(situ_value(h, g));
   }
 }
@@ -290,7 +304,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
       mma_walk(acc_s, q, a.ldq, rows, b, a.ldk, b_cols, kHeadDim, pad);
     }
     store_tile(s_mem, acc_s);
-    leaf::barrier();
+    __syncthreads();
 
     // softmax_rescale_o. One lane per row: this row's new maximum and the rescale of its running sum.
     if (t < rows) {
@@ -308,26 +322,26 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
       row_max[t] = cur;
       float sum = 0.0f;
       if (!first) {
-        const float rescale = exp2f(mul(prev - cur, a.scale_log2));
+        const float rescale = hw_exp2(mul(prev - cur, a.scale_log2));
         row_scale[t] = rescale;
         sum = mul(row_sum[t], rescale);
       }
       row_sum[t] = sum;
       row_max_scaled[t] = cur == -INFINITY ? 0.0f : mul(cur, a.scale_log2);
     }
-    leaf::barrier();
+    __syncthreads();
     // The weights on every lane, then each row's sum on one lane, in the order of its columns.
     for (int i = t; i < kAttnTileM * kAttnStepN; i += kWave) {
       const int r = i / kAttnStepN, c = i % kAttnStepN;
       if (r < rows && c < cols) {
-        const float w = exp2f(fmaf(s_mem[i], a.scale_log2, -row_max_scaled[r]));
+        const float w = hw_exp2(fmaf(s_mem[i], a.scale_log2, -row_max_scaled[r]));
         w_mem[i] = w;
         p_mem[i] = bf(w);
       } else {
         p_mem[i] = 0;
       }
     }
-    leaf::barrier();
+    __syncthreads();
     if (t < rows) {
       float sum = row_sum[t];
       const float* w_row = w_mem + t * kAttnStepN;
@@ -339,7 +353,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
       for (; c2 < cols; ++c2) sum = add(sum, w_row[c2]);
       row_sum[t] = sum;
     }
-    leaf::barrier();
+    __syncthreads();
 
     // The rescale of acc_o needs each element's row, which a fragment does not expose: through memory and back. A row whose
     // maximum did not change has a rescale of exactly 1, and if every row's is, there is nothing to do.
@@ -352,9 +366,9 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
     }
     if (rescale_any) {
       store_tile(o_mem, acc_o);
-      leaf::barrier();
+      __syncthreads();
       for (int i = t; i < rows * kHeadDim; i += kWave) o_mem[i] = mul(o_mem[i], row_scale[i / kHeadDim]);
-      leaf::barrier();
+      __syncthreads();
       HIP_BLOCK_UNROLL
       for (int mf = 0; mf < kMf; ++mf) {
         HIP_BLOCK_UNROLL
@@ -398,7 +412,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
     const float sum = row_sum[t];
     row_scale[t] = sum == 0.0f || sum != sum ? 1.0f : div(1.0f, sum);
   }
-  leaf::barrier();
+  __syncthreads();
   bf16_bits* o = a.o + q_row0 * a.ldo + head * a.hso;
   for (int i = t; i < rows * kHeadDim; i += kWave) {
     const int r = i / kHeadDim, c = i % kHeadDim;
@@ -409,7 +423,10 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
 
 }  // namespace
 
-const char* leaf_name() { return leaf::kName; }
+const char* leaf_name() {
+  // This is a host-only accessor: the device pass's leaf name is not what runs on the host's current device.
+  return mi::hip::device_is_rdna2() ? "RDNA2 v_dot2_f32_f16 (bf16 to fp16), emulated 16x16x16 leaf" : leaf::kName;
+}
 
 void pack_fragments(bf16_bits* to, const bf16_bits* from, std::int64_t ld, std::int64_t rows, std::int64_t rows_padded, int cols,
                     hipStream_t stream) {
@@ -431,10 +448,10 @@ void rms_norm_modulate(const bf16_bits* x, std::int64_t ldx, const bf16_bits* we
 }
 
 void gemm(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w, std::int64_t ldw,
-          int m, int n, int k, hipStream_t stream) {
+          int m, int n, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (m == 0 || n == 0) return;
   const Blocking bl = blocking_of(m, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{out, ldo, x, ldx, w, ldw, nullptr, m, n, k, bl.bm, bl.bn, nullptr, nullptr};
+  const GemmArgs a{out, ldo, x, ldx, w, ldw, nullptr, m, n, k, bl.bm, bl.bn, nullptr, nullptr, lora_delta, ldl};
   gemm_kernel<Epilogue::kPlain><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm");
 }
@@ -446,7 +463,16 @@ void qk_norm_rope(bf16_bits* qkv, std::int64_t ld, std::int64_t tokens, int head
   const std::int64_t rows = tokens * heads;
   const QkArgs a{qkv, ld, q_norm, k_norm, table, table_ld, heads,
                  static_cast<float>(rows) / static_cast<float>(rows * kHeadDim)};
-  qk_norm_rope_kernel<<<dim3(static_cast<unsigned>(tokens * 2 * heads)), dim3(kWave), 0, stream>>>(a);
+  const std::int64_t total = tokens * 2 * heads;
+  // Grid x is (token, head); chunk it only at the device's grid limit. One launch per item would mean hundreds of
+  // thousands of launches per block per step.
+  // gfx11/PAL refuses a launch with 65535 workgroups in one dimension (the theoretical grid limit) at high token
+  // counts; a smaller chunk keeps every launch well inside what the driver can submit.
+  constexpr std::int64_t kChunk = 8192;
+  for (std::int64_t s = 0; s < total; s += kChunk) {
+    const std::int64_t xn = total - s < kChunk ? total - s : kChunk;
+    qk_norm_rope_kernel<<<dim3(static_cast<unsigned>(xn)), dim3(kWave), 0, stream>>>(a, s);
+  }
   check_launch("qk_norm_rope");
 }
 
@@ -462,19 +488,19 @@ void attention(const AttentionArgs& p, hipStream_t stream) {
 }
 
 void gemm_gated_residual(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w,
-                         std::int64_t ldw, const bf16_bits* gate, int m, int n, int k, hipStream_t stream) {
+                         std::int64_t ldw, const bf16_bits* gate, int m, int n, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (m == 0 || n == 0) return;
   const Blocking bl = blocking_of(m, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{residual, ldr, x, ldx, w, ldw, gate, m, n, k, bl.bm, bl.bn, nullptr, nullptr};
+  const GemmArgs a{residual, ldr, x, ldx, w, ldw, gate, m, n, k, bl.bm, bl.bn, nullptr, nullptr, lora_delta, ldl};
   gemm_kernel<Epilogue::kGatedResidual><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_gated_residual");
 }
 
 void gemm_situ_glu(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w_up_gate,
-                   std::int64_t ldw, int m, int f, int k, hipStream_t stream) {
+                   std::int64_t ldw, int m, int f, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (m == 0 || f == 0) return;
   const Blocking bl = blocking_of(m, f, k, kSituTileM, kSituTileF, 2 * kSituTileF);
-  const GemmArgs a{out, ldo, x, ldx, w_up_gate, ldw, nullptr, m, f, k, bl.bm, bl.bn, nullptr, nullptr};
+  const GemmArgs a{out, ldo, x, ldx, w_up_gate, ldw, nullptr, m, f, k, bl.bm, bl.bn, nullptr, nullptr, lora_delta, ldl};
   gemm_situ_kernel<<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_situ_glu");
 }
@@ -490,30 +516,32 @@ namespace {
 // The GEMM ops on packed operands. n is a multiple of the tile's N for all of them, so no tile runs past the weight.
 std::int64_t pack_rows(int tokens) { return (static_cast<std::int64_t>(tokens) + kPackRowsMultiple - 1) / kPackRowsMultiple * kPackRowsMultiple; }
 
-void packed_gemm_plain(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int n, int k, hipStream_t stream) {
+void packed_gemm_plain(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int n, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (b.tokens == 0) return;
   pack_fragments(b.pack, x, ldx, b.tokens, pack_rows(b.tokens), k, stream);
   const Blocking bl = blocking_of(b.tokens, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp};
+  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp, lora_delta, ldl};
   gemm_kernel<Epilogue::kPlain><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm (packed)");
 }
-void packed_gemm_gated(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const bf16_bits* gate, const BlockBuffers& b, int n, int k, hipStream_t stream) {
+void packed_gemm_gated(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const bf16_bits* gate, const BlockBuffers& b, int n, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (b.tokens == 0) return;
   pack_fragments(b.pack, x, ldx, b.tokens, pack_rows(b.tokens), k, stream);
   const Blocking bl = blocking_of(b.tokens, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{residual, ldr, nullptr, 0, nullptr, 0, gate, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp};
+  const GemmArgs a{residual, ldr, nullptr, 0, nullptr, 0, gate, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp, lora_delta, ldl};
   gemm_kernel<Epilogue::kGatedResidual><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_gated_residual (packed)");
 }
-void packed_gemm_situ(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int f, int k, hipStream_t stream) {
+void packed_gemm_situ(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int f, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (b.tokens == 0) return;
   pack_fragments(b.pack, x, ldx, b.tokens, pack_rows(b.tokens), k, stream);
   const Blocking bl = blocking_of(b.tokens, f, k, kSituTileM, kSituTileF, 2 * kSituTileF);
-  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, b.tokens, f, k, bl.bm, bl.bn, b.pack, wp};
+  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, b.tokens, f, k, bl.bm, bl.bn, b.pack, wp, lora_delta, ldl};
   gemm_situ_kernel<<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_situ_glu (packed)");
 }
+}  // namespace
+
 void pack_attention(const BlockBuffers& b, hipStream_t stream) {
   const PackAttnArgs a{b.pack_attn, b.qkv, 3 * kDim, b.cu_seqlens, 3 * kDim / kFrag};
   const unsigned groups = static_cast<unsigned>((b.max_seqlen + kAttentionStepN - 1) / kAttentionStepN * (kAttentionStepN / kFrag));
@@ -521,9 +549,8 @@ void pack_attention(const BlockBuffers& b, hipStream_t stream) {
   check_launch("pack_attention");
 }
 
-}  // namespace
-
-void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream) {
+void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream, const bf16_bits* lora_delta,
+                  std::int64_t ldl) {
   constexpr std::int64_t ldx = kDim, ldq = 3 * kDim;
   const bool packed = w.qkv_packed != nullptr && b.pack != nullptr && b.pack_attn != nullptr;
   const auto mod = [&](int i) { return b.mod + static_cast<std::int64_t>(i) * kDim; };
@@ -533,9 +560,9 @@ void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStrea
     case 0: rms_norm_modulate(b.x, ldx, w.norm1, mod(1), mod(0), b.y, ldx, b.tokens, kDim, stream); break;
     case 1:
       if (packed) {
-        packed_gemm_plain(b.qkv, ldq, b.y, ldx, w.qkv_packed, b, 3 * kDim, kDim, stream);
+        packed_gemm_plain(b.qkv, ldq, b.y, ldx, w.qkv_packed, b, 3 * kDim, kDim, stream, lora_delta, ldl);
       } else {
-        gemm(b.qkv, ldq, b.y, ldx, w.qkv, kDim, b.tokens, 3 * kDim, kDim, stream);
+        gemm(b.qkv, ldq, b.y, ldx, w.qkv, kDim, b.tokens, 3 * kDim, kDim, stream, lora_delta, ldl);
       }
       break;
     case 2: qk_norm_rope(b.qkv, ldq, b.tokens, kHeads, w.q_norm, w.k_norm, b.rope, kHeadDim, stream); break;
@@ -547,31 +574,32 @@ void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStrea
       break;
     case 4:
       if (packed) {
-        packed_gemm_gated(b.x, ldx, b.attn, ldx, w.o_packed, mod(2), b, kDim, kDim, stream);
+        packed_gemm_gated(b.x, ldx, b.attn, ldx, w.o_packed, mod(2), b, kDim, kDim, stream, lora_delta, ldl);
       } else {
-        gemm_gated_residual(b.x, ldx, b.attn, ldx, w.o, kDim, mod(2), b.tokens, kDim, kDim, stream);
+        gemm_gated_residual(b.x, ldx, b.attn, ldx, w.o, kDim, mod(2), b.tokens, kDim, kDim, stream, lora_delta, ldl);
       }
       break;
     case 5: rms_norm_modulate(b.x, ldx, w.norm2, mod(4), mod(3), b.y, ldx, b.tokens, kDim, stream); break;
     case 6:
       if (packed) {
-        packed_gemm_situ(b.ffn, kFfnDim, b.y, ldx, w.up_gate_packed, b, kFfnDim, kDim, stream);
+        packed_gemm_situ(b.ffn, kFfnDim, b.y, ldx, w.up_gate_packed, b, kFfnDim, kDim, stream, lora_delta, ldl);
       } else {
-        gemm_situ_glu(b.ffn, kFfnDim, b.y, ldx, w.up_gate, kDim, b.tokens, kFfnDim, kDim, stream);
+        gemm_situ_glu(b.ffn, kFfnDim, b.y, ldx, w.up_gate, kDim, b.tokens, kFfnDim, kDim, stream, lora_delta, ldl);
       }
       break;
     default:
       if (packed) {
-        packed_gemm_gated(b.x, ldx, b.ffn, kFfnDim, w.down_packed, mod(5), b, kDim, kFfnDim, stream);
+        packed_gemm_gated(b.x, ldx, b.ffn, kFfnDim, w.down_packed, mod(5), b, kDim, kFfnDim, stream, lora_delta, ldl);
       } else {
-        gemm_gated_residual(b.x, ldx, b.ffn, kFfnDim, w.down, kFfnDim, mod(5), b.tokens, kDim, kFfnDim, stream);
+        gemm_gated_residual(b.x, ldx, b.ffn, kFfnDim, w.down, kFfnDim, mod(5), b.tokens, kDim, kFfnDim, stream, lora_delta,
+                            ldl);
       }
       break;
   }
 }
 
 void run_block(const BlockWeights& w, const BlockBuffers& b, hipStream_t stream) {
-  for (int op = 0; op < kBlockOps; ++op) run_block_op(op, w, b, stream);
+  for (int op = 0; op < kBlockOps; ++op) run_block_op(op, w, b, stream, nullptr, 0);
 }
 
 }  // namespace hip_block

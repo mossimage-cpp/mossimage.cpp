@@ -189,6 +189,8 @@ struct GemmArgs {
   int bm, bn;            // block size in tiles
   const bf16_bits* xp;   // packed x and w; null: x and w row-major
   const bf16_bits* wp;
+  const bf16_bits* lora_delta;  // optional [m, n] low-rank term, added to the fp32 accumulator before the epilogue
+  std::int64_t ldl;             // lora_delta's row stride
 };
 
 template <Epilogue kEpilogue>
@@ -225,16 +227,17 @@ __global__ __launch_bounds__(kWave) void gemm_kernel(const GemmArgs a) {
 
   for (int i = thread_id(); i < rows * cols; i += kWave) {
     const int r = i / cols, c = i % cols;
-    const float ab = mem[r * kGemmTileN + c];
+    const float acc = mem[r * kGemmTileN + c] +
+                      (a.lora_delta != nullptr ? f(a.lora_delta[(m0 + r) * a.ldl + n0 + c]) : 0.0f);
     bf16_bits* z = a.out + (m0 + r) * a.ldo + n0 + c;
     if constexpr (kEpilogue == Epilogue::kPlain) {
-      *z = bf(ab);
+      *z = bf(acc);
     } else if constexpr (kEpilogue == Epilogue::kGatedResidual) {
-      *z = bf(add(f(*z), rbf(mul(rbf(ab), f(a.gate[n0 + c])))));  // GatedResidualOp
+      *z = bf(add(f(*z), rbf(mul(rbf(acc), f(a.gate[n0 + c])))));  // GatedResidualOp
     } else if constexpr (kEpilogue == Epilogue::kBias) {
-      *z = bf(add(ab, f(a.gate[n0 + c])));
+      *z = bf(add(acc, f(a.gate[n0 + c])));
     } else {
-      *z = bf(add(f(*z), rbf(add(ab, f(a.gate[n0 + c])))));
+      *z = bf(add(f(*z), rbf(add(acc, f(a.gate[n0 + c])))));
     }
   }
 }

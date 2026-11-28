@@ -3,10 +3,10 @@
 //   - forward(): one sampling step for several rows (cond, uncond, ...). The time embedding and the shared modulation run
 //     once; the rows' joint sequences [video_r | text_r] are concatenated, so each linear runs once over all rows and
 //     attention is one varlen call per run of rows. A block that some rows skip runs on the other rows' token ranges only.
-// Each op follows the reference's order and bf16/fp32 rounding, as the engine's CUDA forward (src/models/moss_dit). The
-// 42 blocks run hip_block's packed path: their GEMM weights are packed on the host at load (hip_block::pack_fragments'
-// layout). Blocks past the device budget stay in pinned host memory and are copied into one of two device slots on a
-// copy stream while the block before them runs.
+// Each op follows the reference's order and bf16/fp32 rounding, as the engine's CUDA forward (src/models/moss_dit).
+// bf16 blocks run hip_block's packed path (weights packed on the host at load into pack_fragments' layout); INT8 ConvRot
+// blocks run int8_block's path instead. Blocks past the device budget stay in pinned host memory and are copied into one
+// of two device slots on a copy stream while the block before them runs.
 #pragma once
 
 #include <bitset>
@@ -16,6 +16,8 @@
 #include <vector>
 
 #include "hip_block.h"
+#include "int8_block.h"
+#include "lora.h"
 #include "runtime.h"
 
 namespace mi::hip {
@@ -37,6 +39,8 @@ struct DitOptions {
   std::uint64_t device_budget = 0;
   // Time each op of every forward with events on the stream (last_op_ms()).
   bool time_ops = false;
+  // Optional runtime LoRA stack, applied as a bf16 side branch to the block GEMMs. The object must outlive the Dit.
+  const Lora* lora = nullptr;
 };
 
 class Dit {
@@ -58,7 +62,14 @@ class Dit {
   // The blocks a DitOptions::device_budget keeps on the device, as the constructor chooses them (0: all 42).
   static int resident_blocks_for(std::uint64_t device_budget);
   // Device memory of forward()'s activations over `tokens` joint tokens of `rows` rows on an h x w = hw latent grid.
-  static std::uint64_t activation_bytes(std::uint64_t tokens, std::uint64_t rows, std::uint64_t hw);
+  static std::uint64_t activation_bytes(std::uint64_t tokens, std::uint64_t rows, std::uint64_t hw,
+                                        bool int8 = false, bool lora = false);
+  // Whether any block was loaded as INT8: the caller must plan scratch from this, not from the requested tier.
+  bool uses_int8() const {
+    for (bool v : is_int8_)
+      if (v) return true;
+    return false;
+  }
 
   // The text refiner on one prompt's text-encoder output, bf16 bits [length, 4096]: device bf16 [length, 3072].
   DeviceBuffer encode_text(const std::vector<std::uint16_t>& embeds, std::uint32_t length);
@@ -91,6 +102,9 @@ class Dit {
   void stage_time(float timestep);  // the time sinusoid to the device, the time scratch sized
   void time_modulation();            // the time MLP and both modulations, on the stream
   void mark(int what);  // time_ops: an event on the stream, its interval since the last one counted as `what`
+  // Computes a LoRA branch's delta t = bf16(x · Aᵀ), delta = bf16(t · Bᵀ) into scratch. The caller fuses delta into the
+  // base GEMM's fp32 accumulator before its bf16 rounding (as the CUDA side branch does). Returns the delta pointer.
+  const bf16* compute_lora_delta(const LoraBranch& branch, const bf16* x, int k, int n, int m, hipStream_t stream);
 
   Device& device_;
   DitOptions options_;
@@ -103,11 +117,16 @@ class Dit {
   DeviceBuffer slots_[2];
   std::unique_ptr<Event> slot_free_[2], copy_done_[2];
   std::vector<hip_block::BlockWeights> blocks_;
+  std::vector<Int8BlockWeights> int8_blocks_;  // the INT8 ConvRot blocks (the high tier); parallel to blocks_
+  std::vector<bool> is_int8_;                  // block l is the INT8 path when set
   Globals g_{};
   std::vector<TextBlock> text_blocks_;
 
   DeviceBuffer x_, y_, qkv_, attn_, ffn_, rope_, tokens_, proj_, up_gate_, embeds_, pack_, pack_attn_, cu_;
   DeviceBuffer mod_, head_, t_in_, hidden_, time_;
+  DeviceBuffer i8_y_, i8_ffn_, i8_scale_, i8_ug_;  // the INT8 block's scratch
+  DeviceBuffer i8_q_, i8_k_, i8_v_, i8_q_scale_, i8_k_scale_, i8_v_scale_, i8_part_, i8_v_fp16_;
+  DeviceBuffer lora_t32_, lora_delta_;  // the LoRA side branch: x · Aᵀ and (x · Aᵀ) · Bᵀ
 
   std::vector<std::unique_ptr<Event>> events_;  // time_ops
   std::vector<int> event_what_;

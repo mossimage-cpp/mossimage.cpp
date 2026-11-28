@@ -58,6 +58,19 @@ std::vector<DeviceInfo> list_devices() {
   return out;
 }
 
+bool device_is_rdna2() {
+#if defined(__HIP_PLATFORM_AMD__)
+  int current = 0;
+  if (hipGetDevice(&current) != hipSuccess) return false;
+  hipDeviceProp_t p{};
+  if (hipGetDeviceProperties(&p, current) != hipSuccess) return false;
+  const std::string arch = p.gcnArchName;
+  return arch.compare(0, 6, "gfx103") == 0;
+#else
+  return false;
+#endif
+}
+
 Device::Device(int index) {
   const std::vector<DeviceInfo> devices = list_devices();
   if (devices.empty()) throw std::runtime_error("hip: no device (" MI_HIP_TARGET " build)");

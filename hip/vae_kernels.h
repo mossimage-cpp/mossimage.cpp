@@ -1,11 +1,17 @@
 // The FLUX.2 VAE decoder's kernels (vae_kernels.hip), at the engine's reference precision (DecodeMode::reference(),
-// kernels/vae/vae_kernels.h): fp32 NHWC activations, convolutions on TF32-rounded operands with fp32 accumulation,
-// fp32-exact attention linears, fp32-accurate attention, GroupNorm statistics from exact integer sums.
+// kernels/vae/vae_kernels.h): NHWC activations (fp32, fp16 on gfx103x or bf16 on gfx11/gfx12), convolutions with fp32
+// accumulation over TF32-rounded operands (or one fp16/bf16 operand on the fast paths), attention linears/scores/PV from
+// two TF32 bf16 pieces by default (three for the exact fp32 path), GroupNorm statistics from exact integer sums. The
+// int *_fmt / *_round arguments select activation storage and operand rounding: 0 = fp32 storage / bf16 pieces,
+// 1 = fp16, 2 = bf16. The host keeps 16-bit buffers in the matching element type, while the kernels cast the
+// float-typed pointers back.
 //
-// The matrix products run on the backend's 16x16x16 bf16 leaf (mma_leaf.h), which multiplies bf16 values exactly into
-// fp32 accumulators. An fp32 operand becomes bf16 pieces whose sum is the operand: a TF32 value (11 significant bits) is
+// The matrix products run on the backend's 16x16x16 leaves: mma_leaf.h's rocWMMA/dot-product leaf for the multi-piece
+// path, and bf16_leaf.h's raw gfx11 WMMA leaf for one bf16 operand. The leaf multiplies bf16 values exactly into fp32
+// accumulators. An fp32 operand becomes bf16 pieces whose sum is the operand: a TF32 value (11 significant bits) is
 // exactly 2 pieces, an fp32 value (24 bits) exactly 3. A product of two operands is the sum of the products of their
-// pieces, each exact in fp32; which of them a kernel adds is its Products value below. Within one 16-wide K step the
+// pieces, each exact in fp32; which of them a kernel adds is its Products value below. Products::kFp16 and ::kBf16 keep
+// a single fp16/bf16-rounded operand instead, one product per MAC. Within one 16-wide K step the
 // products are added B piece by B piece from the smallest piece, and for each the A pieces from the smallest.
 // An infinite or NaN operand is its piece 0 alone: a product with it is non-finite, NaN where a piece of the other
 // operand is 0 or has the other sign, so an infinity in an input gives ±Inf or NaN outputs, never finite ones.
@@ -26,6 +32,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "half.h"
+
 namespace hip_vae {
 
 // Rows and columns of a wave's output tile: kTileM x kConvTileN for the convolutions, kTileM x kTileN for piece_gemm.
@@ -39,8 +47,12 @@ inline constexpr int kGroups = 32;  // GroupNorm groups
 //   kTf32       2 x 2 pieces, all 4 products: the exact product of the TF32-rounded operands (cuDNN's TF32 convolution)
 //   kTf32Drop   2 x 2 pieces without lo x lo (i + j < 2): each product short by at most 2^-16 of |a b|
 //   kFp32       3 x 3 pieces, all 9 products: the exact product of fp32 operands (a strict fp32 GEMM)
-enum class Products { kTf32, kTf32Drop, kFp32 };
-inline int pieces_of(Products p) { return p == Products::kFp32 ? 3 : 2; }
+//   kFp16       one fp16 piece per operand, one product: fp16-rounded operands, fp32 accumulation (gfx1035)
+//   kBf16       one bf16 piece per operand, one product: bf16-rounded operands, fp32 accumulation (gfx11 matrix cores)
+enum class Products { kTf32, kTf32Drop, kFp32, kFp16, kBf16 };
+inline int pieces_of(Products p) {
+  return p == Products::kFp32 ? 3 : (p == Products::kFp16 || p == Products::kBf16 ? 1 : 2);
+}
 const char* products_name(Products p);
 
 inline std::int64_t round_up(std::int64_t v, std::int64_t m) { return (v + m - 1) / m * m; }
@@ -69,9 +81,18 @@ inline float host_bf16_value(std::uint16_t b) {
   std::memcpy(&v, &u, 4);
   return v;
 }
+inline std::uint16_t host_fp16_bits(float v) {  // RNE fp16, clamped like the device's conversion
+  return mi::hip::float_to_half(std::fminf(std::fmaxf(v, -65504.0f), 65504.0f));
+}
+inline float host_fp16_value(std::uint16_t h) { return mi::hip::half_to_float(h); }
 // v (TF32-rounded first for TF32 products) as pieces_of(p) bf16 pieces, each the nearest bf16 of what the previous left.
-// An infinity or NaN is piece 0, the other pieces 0.
+// An infinity or NaN is piece 0, the other pieces 0. kFp16/kBf16 keep a single fp16/bf16-rounded operand instead.
 inline void host_split(float v, Products p, std::uint16_t* piece) {
+  if (p == Products::kFp16 || p == Products::kBf16) {
+    piece[0] = p == Products::kFp16 ? host_fp16_bits(v) : host_bf16_bits(v);
+    for (int t = 1; t < pieces_of(p); ++t) piece[t] = 0;
+    return;
+  }
   float r = p == Products::kFp32 ? v : host_tf32(v);
   const bool finite = std::isfinite(v);
   for (int t = 0; t < pieces_of(p); ++t) {
@@ -98,6 +119,11 @@ struct ConvArgs {
   int h = 0, w_out = 0, c = 0, n = 0;
   int taps = 0;
   bool upsample = false;
+  // 16-bit activation storage: x, out and residual point to 16-bit bits reinterpreted as float pointers. 0 = fp32,
+  // 1 = fp16 bits, 2 = bf16 bits. Bias and weights stay fp32. The host keeps the buffers in the matching element type
+  // so its pointer arithmetic stays in elements; only the kernels cast back.
+  int x_fmt = 0;
+  int out_fmt = 0;  // also selects the residual's storage
 };
 void conv(const ConvArgs& a, Products products, hipStream_t stream);
 
@@ -105,31 +131,34 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream);
 std::size_t packed_weight_elems(int n, int k, Products products);
 void pack_weight(const float* w, int n, int k, Products products, std::uint16_t* out);
 
-// conv_out: a 3x3 convolution (zero padding 1) to n <= 4 channels in fp32 with the TF32-rounded operands' exact products,
-// one output pixel per thread: out[m, n] = sum_k + bias[n]. w_tf32: [n, 9 c] KRSC, already TF32-rounded (host_tf32);
-// c a multiple of 4; out [h w, n].
-void conv_narrow(const float* x, const float* w_tf32, const float* bias, float* out, int h, int w, int c, int n,
-                 hipStream_t stream);
+// conv_out: a 3x3 convolution (zero padding 1) to n <= 4 channels with fp32 accumulation, one output pixel per thread:
+// out[m, n] = sum_k + bias[n]. w: [n, 9 c] KRSC, rounded to the selected operand format (host_tf32/fp16/bf16);
+// c a multiple of 4; out [h w, n] fp32. round: 0 = TF32, 1 = fp16, 2 = bf16. act_fmt selects x's storage format.
+void conv_narrow(const float* x, const float* w_rounded, const float* bias, float* out, int h, int w, int c, int n,
+                 hipStream_t stream, int round = 0, int act_fmt = 0);
 
 // ---- Attention ------------------------------------------------------------------------------------------------------
 
 // src [rows, cols] fp32 (element (r, c) = src[r * ld + c], or src[c * ld + r] when `transpose`) -> 3 packed pieces of
 // [rows_pad, cols_pad] (multiples of 16) in dst, zeros past rows and cols.
+// `pieces` selects 3 (fp32-accurate), 2 (TF32 precision) or 1 (fp16/bf16-rounded operand). src_fmt: 0 = fp32, 1 = fp16
+// bits, 2 = bf16 bits. round: 0 = multi-piece bf16 (TF32/fp32), 1 = one fp16 operand, 2 = one bf16 operand.
 void split_pack(const float* src, std::int64_t ld, bool transpose, int rows, int cols, std::uint16_t* dst, int rows_pad,
-                int cols_pad, hipStream_t stream);
+                int cols_pad, hipStream_t stream, int pieces = 3, int src_fmt = 0, int round = 0);
 
-// out[m, n] = sum_k A[m, k] B[n, k] over 3-piece packed operands with the products i + j <= 2 (fp32-accurate: every
-// dropped product is at most 2^-24 |a b|), fp32, for m < m_rows and n < n_cols. a: [a_rows_pad, k_pad] packed, piece
-// stride a_stride elements, a_rows_pad >= round_up(m_rows, kTileM); b likewise with b_rows_pad >= round_up(n_cols,
-// kTileN). ldo a multiple of 4.
+// out[m, n] = sum_k A[m, k] B[n, k] over packed operands, fp32, for m < m_rows and n < n_cols. With 3 pieces the products
+// i + j <= 2 are kept (fp32-accurate: every dropped product is at most 2^-24 |a b|); with 2, i + j <= 1 (TF32, dropping
+// lo x lo). a: [a_rows_pad, k_pad] packed, piece stride a_stride elements, a_rows_pad >= round_up(m_rows, kTileM); b
+// likewise with b_rows_pad >= round_up(n_cols, kTileN). ldo a multiple of 4.
 void piece_gemm(const std::uint16_t* a, std::int64_t a_stride, const std::uint16_t* b, std::int64_t b_stride, int k_pad,
-                float* out, std::int64_t ldo, int m_rows, int n_cols, hipStream_t stream);
+                float* out, std::int64_t ldo, int m_rows, int n_cols, hipStream_t stream, int pieces = 3, int out_fmt = 0,
+                int round = 0);
 
 // Row softmax of attention scores into packed P pieces: p(r, j) = exp(s[r, j] * scale - max_j(s[r, :]) * scale) /
-// sum_j(...) for j < l, as 3 packed pieces of [rows_pad, l_pad] at piece stride p_stride (rows r < rows written; columns
-// past l written as 0). s: [rows, lds] fp32.
+// sum_j(...) for j < l, as `pieces` packed pieces of [rows_pad, l_pad] at piece stride p_stride (rows r < rows written;
+// columns past l written as 0). s: [rows, lds] fp32.
 void softmax_pack(const float* s, std::int64_t lds, int rows, int l, float scale, std::uint16_t* p, std::int64_t p_stride,
-                  int l_pad, hipStream_t stream);
+                  int l_pad, hipStream_t stream, int pieces = 3, int round = 0);
 
 // ---- GroupNorm ------------------------------------------------------------------------------------------------------
 
@@ -138,17 +167,26 @@ void softmax_pack(const float* s, std::int64_t lds, int rows, int l, float scale
 // fp64, rounded to stats[g] = {mean, rstd} fp32 with rstd = 1 / sqrt(var + eps). |x| < 2^33, else that group's stats are
 // NaN. accum: gn_accum_bytes(), zeroed by this call.
 std::size_t gn_accum_bytes();
-void group_norm_stats(const float* x, std::int64_t pixels, int c, float eps, void* accum, float* stats, hipStream_t stream);
+void group_norm_stats(const float* x, std::int64_t pixels, int c, float eps, void* accum, float* stats, hipStream_t stream,
+                      int x_fmt = 0);
+// The same statistics, split so several tensor slices can be accumulated separately (the exact band-tiled VAE
+// decoder uses one slice per band). gn_accum_zero clears the accumulators, gn_accumulate adds x [pixels, c] (any
+// number of calls, in any order), and gn_finalize writes stats[g] = {mean, rstd} using count_per_group values per
+// group (the whole tensor's pixels * c / kGroups). The sums are fixed-point integers, so splitting is bit-exact.
+void gn_accum_zero(void* accum, hipStream_t stream);
+void gn_accumulate(const float* x, std::int64_t pixels, int c, void* accum, hipStream_t stream, int x_fmt = 0);
+void gn_finalize(void* accum, std::int64_t count_per_group, float eps, float* stats, hipStream_t stream);
 // y = fma(a, x, fma(-a, mean, beta)) with a = rstd * gamma (torch's fused GroupNorm parameters); with silu,
-// y / (1 + exp(-y)). y may be x.
+// y / (1 + exp(-y)). y may be x. x_fmt/y_fmt select the activation storage format (cast through the float pointers).
 void group_norm_apply(const float* x, float* y, std::int64_t pixels, int c, const float* stats, const float* gamma,
-                      const float* beta, bool silu, hipStream_t stream);
+                      const float* beta, bool silu, hipStream_t stream, int x_fmt = 0, int y_fmt = 0);
 
 // ---- Pipeline ends ----------------------------------------------------------------------------------------------------
 
 // z [128, h, w] fp32 NCHW -> y [2h, 2w, 32] fp32 NHWC: y[2i + p, 2j + q, c] = z[4c + 2p + q, i, j] * scale + mean of that
 // latent channel, each op rounded (scale = sqrt(var + eps), formed on the host).
-void latent_unpack(const float* z, const float* scale, const float* mean, float* y, int h, int w, hipStream_t stream);
+void latent_unpack(const float* z, const float* scale, const float* mean, float* y, int h, int w, hipStream_t stream,
+                   int y_fmt = 0);
 
 // x [n] fp32 -> rgb [n] bytes as the pipeline: clamp(-1, 1), (x * 0.5 + 0.5).clamp(0, 1), (x * 255) rounded half to
 // even; NaN gives 0.

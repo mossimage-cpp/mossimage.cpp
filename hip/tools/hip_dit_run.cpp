@@ -15,7 +15,7 @@
 //     golden rms (sqrt(2 x 0.05)). A gross-error gate: 50 steps of sampling amplify small differences, so a correct DiT
 //     lands well below step 0's agreement. The Vulkan DiT on these golden text-encoder outputs reaches 0.957 (coop) and
 //     0.971 (plain), and two runs differing only in their text encoder (cosine 0.9998 between those) ended 0.9706 apart;
-//     the CUDA engine reaches 0.992. The bound was set from those, before any HIP figure;
+//     the CUDA engine reaches 0.992;
 //   - with --expect, any bit of the latent after the steps differing from the file's.
 // Exit status: 0 when every gate passes, 1 otherwise or on an error, 2 without a usable device.
 #include <chrono>

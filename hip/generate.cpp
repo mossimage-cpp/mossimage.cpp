@@ -5,11 +5,18 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
+#include "lora.h"
 #include "text_encoder.h"
 #include "vae.h"
 
@@ -22,8 +29,15 @@ double now_s() {
 
 double gib(std::uint64_t bytes) { return static_cast<double>(bytes) / static_cast<double>(1ull << 30); }
 
-// MemAvailable of /proc/meminfo: what the host can give, the page cache it would drop included.
+// What the host can give to a pinned allocation: MemAvailable of /proc/meminfo on Linux (the page cache it would drop
+// included), the physical memory the processes can use on Windows.
 std::uint64_t host_available_bytes() {
+#if defined(_WIN32)
+  MEMORYSTATUSEX s{};
+  s.dwLength = sizeof s;
+  if (!GlobalMemoryStatusEx(&s)) return std::numeric_limits<std::uint64_t>::max();
+  return s.ullAvailPhys;
+#else
   std::ifstream in("/proc/meminfo");
   std::string key;
   std::uint64_t kib = 0;
@@ -32,9 +46,26 @@ std::uint64_t host_available_bytes() {
     in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
   }
   return std::numeric_limits<std::uint64_t>::max();  // unknown: not refused here
+#endif
 }
 
 [[noreturn]] void fail(const std::string& what) { throw std::invalid_argument("hip generate: " + what); }
+
+// The band height is the only tiling control. An invalid value must not turn a decode failure into a confusing planner
+// exception, so warn and fall back to the default instead.
+int band_tile_px() {
+  constexpr int kDefault = 512;
+  const char* s = std::getenv("MI_HIP_VAE_BAND_TILE_PX");
+  if (s == nullptr || *s == '\0') return kDefault;
+  char* end = nullptr;
+  const long v = std::strtol(s, &end, 10);
+  if (end != s && *end == '\0' && v >= 8 && v <= std::numeric_limits<int>::max() && v % 8 == 0)
+    return static_cast<int>(v);
+  std::fprintf(stderr,
+               "moss-infer-hip: ignoring MI_HIP_VAE_BAND_TILE_PX=%s (want a positive multiple of 8); using %d\n", s,
+               kDefault);
+  return kDefault;
+}
 
 }  // namespace
 
@@ -53,20 +84,59 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   GenerateResult out;
   out.width = r.width;
   out.height = r.height;
+  // A component may be a single safetensors file (--dit/--te/--vae) instead of the bundle's directory.
+  const auto component = [&](const std::filesystem::path& file, const char* sub) {
+    return file.empty() ? r.model_dir / sub : file;
+  };
 
-  // The VAE first (about 0.1 GiB of weights, kept through the run), so a decode the device cannot hold fails before the
-  // text encoder and the steps run rather than after them.
+  // The adapter holds device weights for the whole run. Allocate it before any memory budget is computed so that
+  // the budget and the later activation check both account for it.
+  std::optional<Lora> lora;
+  if (!r.lora_file.empty()) {
+    device.make_current();
+    lora.emplace(r.lora_file, r.lora_scale, kDiTLayers);
+  }
+  const std::uint64_t lora_bytes = lora != std::nullopt ? static_cast<std::uint64_t>(lora->device_bytes()) : 0;
+  if (r.vram_budget != 0 && lora_bytes >= r.vram_budget)
+    fail("the LoRA's device weights (" + std::to_string(lora_bytes) + " bytes) leave nothing under the VRAM budget");
+  const std::uint64_t budget_limit =
+      r.vram_budget != 0 ? r.vram_budget - lora_bytes : 0;  // the budget that remains for VAE + DiT
+
+  // The VAE first (about 0.1 GiB of weights, kept through the run). A full decode that fails is retried in tiles
+  // after the text encoder and DiT have been freed.
   std::optional<VaeDecoder> vae;
+  bool force_tiled = false;
   if (r.decode) {
-    vae.emplace(device, r.model_dir / "vae" / "diffusion_pytorch_model.safetensors");
-    vae->require_fits(lh, lw);  // also refuses a size past the decoder's limits
-    if (const std::uint64_t need = vae->weight_bytes() + vae->workspace_bytes(lh, lw); r.vram_budget != 0 && need > r.vram_budget) {
-      char msg[256];
-      std::snprintf(msg, sizeof msg,
-                    "the VAE decode of a %ux%u image needs %.2f GiB of device memory with its weights, more than a VRAM "
-                    "budget of %.2f GiB",
-                    r.width, r.height, gib(need), gib(r.vram_budget));
-      throw std::runtime_error(msg);
+    vae.emplace(device, component(r.vae_file, "vae/diffusion_pytorch_model.safetensors"));
+    vae->set_profile(std::getenv("MI_HIP_VAE_PROFILE") != nullptr);
+    // An explicit budget is a hard limit on the decode as well. If the full decode does not fit, use the exact band
+    // decoder; refuse before the text encoder and the sampling steps only when even that does not fit.
+    if (budget_limit != 0 && vae->weight_bytes() + vae->workspace_bytes(lh, lw) > budget_limit) {
+      std::uint64_t tiled_bytes = 0;
+      try {
+        tiled_bytes = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, band_tile_px()).workspace_bytes;
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "moss-infer-hip: no tiled VAE schedule: %s\n", e.what());
+      }
+      if (tiled_bytes != 0 && vae->weight_bytes() + tiled_bytes <= budget_limit) {
+        std::fprintf(stderr, "moss-infer-hip: full VAE decode exceeds the VRAM budget; using the exact band decoder\n");
+        force_tiled = true;
+      } else {
+        char msg[512];
+        if (tiled_bytes != 0)
+          std::snprintf(msg, sizeof msg,
+                        "the VAE decode at %ux%u does not fit a VRAM budget of %.2f GiB: the weights take %.2f GiB, a "
+                        "full decode %.2f GiB and the smallest band-tiled decode %.2f GiB",
+                        r.width, r.height, gib(r.vram_budget), gib(vae->weight_bytes()),
+                        gib(vae->workspace_bytes(lh, lw)), gib(tiled_bytes));
+        else
+          std::snprintf(msg, sizeof msg,
+                        "the VAE decode at %ux%u does not fit a VRAM budget of %.2f GiB: the weights take %.2f GiB, a "
+                        "full decode %.2f GiB, and no band-tiled schedule was found",
+                        r.width, r.height, gib(r.vram_budget), gib(vae->weight_bytes()),
+                        gib(vae->workspace_bytes(lh, lw)));
+        throw std::runtime_error(msg);
+      }
     }
   }
 
@@ -82,6 +152,10 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   // hipMalloc rounds an allocation up to 2 MiB at worst: the weights' (the globals, the two refiner blocks, each block
   // on the device, the two slots) and the activations' (about 20 buffers).
   constexpr std::uint64_t kWeightRounding = (kDiTLayers + 5) * 2 * kMiB, kActivationMargin = 64 * kMiB;
+  // On APUs and dGPUs with a large BAR, hipMalloc can back allocations from system shared memory after hipMemGetInfo
+  // has reported little or no free memory. With the automatic budget we therefore let the allocator decide instead of
+  // refusing on that report; an explicit --vram-budget remains a hard limit.
+  constexpr std::uint64_t kAllocatorSlack = 16ull << 30;
   const std::uint64_t hw = std::uint64_t{lh} * lw;
   const std::uint64_t vae_bytes = vae ? vae->weight_bytes() : 0;
   char budget[64];
@@ -90,21 +164,26 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   } else {
     std::snprintf(budget, sizeof budget, "the automatic budget");
   }
-  struct DitPlan {
-    std::uint64_t activations, weights;
-  };
-  const auto plan = [&](const std::vector<std::uint64_t>& lengths, std::uint64_t free) {
+  // Kept separate from plan() so the check after the DiT is loaded can re-evaluate it with the actual INT8 layout:
+  // --tier is only a request, the loaded tensors decide which scratch Dit::forward() allocates.
+  const auto activation_bytes = [&](const std::vector<std::uint64_t>& lengths, bool int8) {
     std::uint64_t tokens = 0, text_rows = 0, longest = 0;
     for (const std::uint64_t length : lengths) {
       tokens += hw + length;
       text_rows += length;
       longest = std::max(longest, length);
     }
-    const std::uint64_t activations = Dit::activation_bytes(tokens, lengths.size(), hw) +
-                                      longest * (kDiTTextDim + 2 * std::uint64_t{kDiTFfnDim}) * kBf16 +
-                                      text_rows * kDiTDim * kBf16;
+    return Dit::activation_bytes(tokens, lengths.size(), hw, int8, lora.has_value()) +
+           longest * (kDiTTextDim + 2 * std::uint64_t{kDiTFfnDim}) * kBf16 + text_rows * kDiTDim * kBf16;
+  };
+  struct DitPlan {
+    std::uint64_t activations, weights;
+  };
+  const auto plan = [&](const std::vector<std::uint64_t>& lengths, std::uint64_t free) {
+    const std::uint64_t activations = activation_bytes(lengths, r.int8_dit);
     const std::uint64_t need = activations + kReserve;
     char msg[512];
+    if (need > free && r.vram_budget == 0) free = need + kAllocatorSlack;
     if (need > free) {
       std::snprintf(msg, sizeof msg,
                     "the DiT at %ux%u needs %.2f GiB of device memory beside its weights (activations %.2f GiB, reserve "
@@ -113,15 +192,15 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
       throw std::runtime_error(msg);
     }
     std::uint64_t room = free - need;
-    if (r.vram_budget != 0) {
-      if (r.vram_budget <= vae_bytes + need) {
+    if (budget_limit != 0) {
+      if (budget_limit <= vae_bytes + need) {
         std::snprintf(msg, sizeof msg,
                       "%s leaves nothing for the DiT's weights: the VAE's weights take %.2f GiB and the DiT at %ux%u needs "
                       "%.2f GiB beside its weights (activations %.2f GiB, reserve %.2f GiB)",
                       budget, gib(vae_bytes), r.width, r.height, gib(need), gib(activations), gib(kReserve));
         throw std::runtime_error(msg);
       }
-      room = std::min(room, r.vram_budget - vae_bytes - need);
+      room = std::min(room, budget_limit - vae_bytes - need);
     }
     const std::uint64_t weights = room > kWeightRounding ? room - kWeightRounding : 0;
     if (weights < Dit::minimum_weight_bytes()) {
@@ -153,17 +232,34 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     plan(lengths, device.free_memory());
   }
 
-  // Text encoder: streamed layer by layer, freed before the DiT loads.
+  // Text encoder: streamed layer by layer, freed before the DiT loads. The reset is explicit rather than relying on
+  // the scope's destructor so the release happens right here, before the DiT's budget is measured; the synchronize
+  // makes hipMemGetInfo see the reclaimed memory on drivers that defer the free until the queue drains.
   std::vector<std::vector<std::uint16_t>> embeds;
   {
     double t0 = now_s();
+    report("text encoder load", 0, 1);
+    TextEncoderOptions te_options;
+    const char* ed = std::getenv("MI_HIP_TE_EXACT_DEQUANT");
+    te_options.exact_dequant = ed != nullptr && std::strcmp(ed, "0") != 0;
+    const char* pg = std::getenv("MI_HIP_TE_PACKED_GEMM");
+    te_options.tiled_gemm = pg == nullptr || std::strcmp(pg, "0") == 0;
+    const char* dd = std::getenv("MI_HIP_TE_DEVICE_DEQUANT");
+    te_options.device_dequant = dd == nullptr || std::strcmp(dd, "0") != 0;
+    std::optional<TextEncoder> encoder;
+    encoder.emplace(device, component(r.te_file, "text_encoder"), te_options);
+    const double load_s = now_s() - t0;
+    report("text encoder load", 1, 1);
+    t0 = now_s();
     report("text encoder", 0, 1);
-    TextEncoder encoder(device, r.model_dir / "text_encoder");
     std::vector<std::vector<std::int32_t>> sequences{r.cond_ids};
     if (cfg) sequences.push_back(r.uncond_ids);
-    embeds = encoder.encode(sequences);
+    embeds = encoder->encode(sequences);
     out.text_encoder_s = now_s() - t0;
     report("text encoder", 1, 1);
+    out.text_encoder_load_s = load_s;
+    encoder.reset();
+    device.synchronize();
   }
 
   // DiT: resident, the text refiner once per prompt, then the steps.
@@ -174,18 +270,24 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     const DitPlan p = plan(lengths, device.free_memory());
     DitOptions options;
     options.device_budget = p.weights;  // >= Dit::minimum_weight_bytes(), so never 0 (every block resident)
-    Dit dit(device, r.model_dir / "transformer", options);
+    options.lora = lora.has_value() ? &*lora : nullptr;
+    Dit dit(device, component(r.dit_file, "transformer"), options);
     out.dit_resident_blocks = dit.resident_blocks();
     // What is left must hold the activations; the reserve absorbs the runtime's own allocations and the rounding.
     out.dit_free_bytes = device.free_memory();
-    if (out.dit_free_bytes < p.activations + kActivationMargin) {
+    // Re-evaluate with the loaded model's real activation mode: --tier high/reference is only a request, a
+    // single-file --dit override can load INT8 tensors even when the tier says reference.
+    const std::uint64_t activations = std::max(p.activations, activation_bytes(lengths, dit.uses_int8()));
+    if (out.dit_free_bytes < activations + kActivationMargin) {
       char msg[512];
       std::snprintf(msg, sizeof msg,
                     "the DiT's weights take %.2f GiB of device memory (%s); beside them its activations at %ux%u need "
-                    "%.2f GiB, %s has %.2f GiB free",
-                    gib(dit.weight_bytes()), budget, r.width, r.height, gib(p.activations + kActivationMargin),
+                    "%.2f GiB, %s reports %.2f GiB free",
+                    gib(dit.weight_bytes()), budget, r.width, r.height, gib(activations + kActivationMargin),
                     device.info().name.c_str(), gib(out.dit_free_bytes));
-      throw std::runtime_error(msg);
+      // With an explicit budget this is a real limit. With the automatic budget the report can be zero long before
+      // shared memory is exhausted, so continue and let an actual hipMalloc failure report the real limit.
+      if (r.vram_budget != 0) throw std::runtime_error(msg);
     }
     std::vector<DeviceBuffer> texts;
     texts.reserve(embeds.size());  // the rows point into it
@@ -222,13 +324,45 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     out.denoise_s = now_s() - t0;
     out.latents = std::move(latents);
   }
+  device.synchronize();
 
   // VAE decode, after handing the final latents to the caller (a failed decode keeps them).
   if (r.on_latents) r.on_latents(out.latents);
   if (r.decode) {
     const double t0 = now_s();
     report("vae", 0, 1);
-    vae->decode(out.latents.data(), lh, lw, out.rgb);
+    VaeDecodeStats vst;
+    // --vae-tiled requests tiling up front; a full decode that throws is retried the same way. This is an error
+    // fallback, not a memory prediction. The exact band decoder is byte-identical to the full decode.
+    const auto tiled = [&]() -> VaeDecodeStats {
+      const VaeTilePlan plan = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, band_tile_px());
+      std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan.describe().c_str());
+      return vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, plan);
+    };
+    if (r.vae_tiled || force_tiled) {
+      std::fprintf(stderr, "moss-infer-hip: VAE decode: exact band tiling (%s)\n",
+                   r.vae_tiled ? "--vae-tiled" : "explicit VRAM budget");
+      out.vae_decode_path = r.vae_tiled ? GenerateResult::VaeDecodePath::kTiledRequested
+                                        : GenerateResult::VaeDecodePath::kTiledBudget;
+      vst = tiled();
+    } else {
+      std::fprintf(stderr, "moss-infer-hip: VAE decode: full frame\n");
+      try {
+        vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
+        out.vae_decode_path = GenerateResult::VaeDecodePath::kFull;
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "moss-infer-hip: full VAE decode failed (%s); falling back to exact band tiling\n",
+                     e.what());
+        out.vae_decode_note = e.what();
+        out.vae_decode_path = GenerateResult::VaeDecodePath::kTiledFallback;
+        vst = tiled();
+      }
+    }
+    if (!vst.profile.empty()) {
+      std::fprintf(stderr, "[vae-op]");
+      for (const auto& [name, ms] : vst.profile) std::fprintf(stderr, " %s=%.0fms", name.c_str(), ms);
+      std::fprintf(stderr, "\n");
+    }
     out.vae_s = now_s() - t0;
     report("vae", 1, 1);
   }

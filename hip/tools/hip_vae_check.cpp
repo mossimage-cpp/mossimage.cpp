@@ -12,13 +12,39 @@
 //   - Infinities and NaN in an operand give non-finite outputs exactly where the replay's do, the others stay right.
 //   - split_pack, the latent unpack, RGB8 and the GroupNorm statistics bit for bit; the softmax's pieces must be an exact
 //     split of an fp32 probability within 3e-6 of the fp64 softmax; GroupNorm apply within 2e-6 of |a x| + |a mean|.
-//   - The decode: PSNR, max and mean |diff| and identical bytes against the golden PNG. It passes with no NaN, no byte off
-//     by more than 1 and at least 99 % of the bytes identical (the CUDA engine's reference decode: 99.1-99.3 %, max 1).
+//   - The decode: PSNR, max and mean |diff| and identical bytes against the golden PNG. The gate follows the decoder's
+//     operand mode: exact/TF32 passes with no NaN, no byte off by more than 1 and at least 99 % identical (the CUDA
+//     reference decode: 99.1-99.3 %, max 1); one 16-bit operand per MAC (fp16/bf16) passes with no NaN, max 8 and 80 %.
 //   - Non-square decodes (run_nonsquare) and the size limits (check_limits).
+//   - --tiled-check: the same latents decoded full and band-tiled at several band heights (including a partial final
+//     band, both the min-memory planner and a uniform schedule): RGB must be byte-identical.
 // Exit status: 0 everything passed, 1 a check failed, 2 bad usage or no usable device.
 // Usage: hip_vae_check [--device N] [--kat-only | --no-kat] [--vae FILE] [--golden DIR] [--case NAME]... [--no-golden] [--no-nonsquare]
-//                      [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3]
+//                      [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3|1] [--tiled-check]
+// --conv-products only switches operand rounding within the family the decoder was packed for (4/3: TF32, 1: fp16);
+// bf16 is selected at decoder construction on gfx11/gfx12 and cannot be changed here.
+// Some Windows SDK builds (notably the TheRock clang-cl toolchain) ship no zlib. Keep the check buildable there: the
+// PNG golden-image checks then report that zlib is unavailable; all other checks, including --tiled-check, work.
+#if defined(MI_HIP_VAE_NO_ZLIB)
+#include <cstddef>
+#include <stdexcept>
+namespace {
+using uLong = unsigned long;
+using uLongf = unsigned long;
+using uInt = unsigned int;
+constexpr int Z_OK = 0;
+[[noreturn]] inline uLong crc32(uLong, const unsigned char*, uInt) { throw std::runtime_error("zlib not available"); }
+[[noreturn]] inline uLongf uncompress(unsigned char*, uLongf*, const unsigned char*, uLong) {
+  throw std::runtime_error("zlib not available");
+}
+[[noreturn]] inline uLong compressBound(uLong) { throw std::runtime_error("zlib not available"); }
+[[noreturn]] inline int compress2(unsigned char*, uLongf*, const unsigned char*, uLong, int) {
+  throw std::runtime_error("zlib not available");
+}
+}  // namespace
+#else
 #include <zlib.h>
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -242,6 +268,9 @@ struct ConvCase {
 double product(float a, float b, Products p) {
   if (p == Products::kFp32) return static_cast<double>(a) * b;
   if (p == Products::kTf32) return static_cast<double>(hip_vae::host_tf32(a)) * hip_vae::host_tf32(b);
+  if (p == Products::kFp16)
+    return static_cast<double>(hip_vae::host_fp16_value(hip_vae::host_fp16_bits(a))) *
+           hip_vae::host_fp16_value(hip_vae::host_fp16_bits(b));
   std::uint16_t pa[2], pb[2];
   hip_vae::host_split(a, p, pa);
   hip_vae::host_split(b, p, pb);
@@ -257,7 +286,9 @@ void check_conv(const ConvCase& cc, hipStream_t stream) {
   const auto wt = random_f32(2, static_cast<std::size_t>(cc.n) * static_cast<std::size_t>(k), -0.5f, 0.5f);
   const auto bias = random_f32(3, static_cast<std::size_t>(cc.n), -1.0f, 1.0f);
   const auto res = random_f32(4, static_cast<std::size_t>(m * cc.ldo), -4.0f, 4.0f);
-  const Products pack_as = cc.products == Products::kFp32 ? Products::kFp32 : Products::kTf32;
+  const Products pack_as = cc.products == Products::kFp16 ? Products::kFp16
+                           : cc.products == Products::kFp32 ? Products::kFp32
+                                                            : Products::kTf32;
   std::vector<std::uint16_t> packed(hip_vae::packed_weight_elems(cc.n, k, pack_as));
   hip_vae::pack_weight(wt.data(), cc.n, k, pack_as, packed.data());
   DeviceBuffer dx = upload(x), dw = upload(packed), db = upload(bias), dout = upload(res);  // out poisoned with the residual
@@ -1191,12 +1222,14 @@ std::uint8_t host_u8(float v) {  // the pipeline's rounding (rgb8)
 struct Options {
   int device = -1;
   bool kat = true, decode = true, profile = false, nonsquare = true, golden_cases = true;
-  fs::path vae = "/workspace/Models/MOSS-Image/base/vae/diffusion_pytorch_model.safetensors";
-  fs::path golden = "/workspace/Projects/MossInfer/tests/golden";
+  fs::path vae = "models/MOSS-Image/vae/diffusion_pytorch_model.safetensors";
+  fs::path golden = "tests/golden";
   std::vector<std::string> cases;
   fs::path out_dir;
   int iters = 1;
   Products conv_products = Products::kTf32;
+  bool conv_products_set = false;
+  bool tiled_check = false;
 };
 
 void run_decode(Device& device, VaeDecoder& decoder, const Options& o, const std::string& name) {
@@ -1206,8 +1239,9 @@ void run_decode(Device& device, VaeDecoder& decoder, const Options& o, const std
   if (shape.size() != 3 || shape[0] != 128) throw std::runtime_error(name + ": final_latent.npy is not [1, 128, h, w]");
   const auto h = static_cast<std::uint32_t>(shape[1]), w = static_cast<std::uint32_t>(shape[2]);
   const std::vector<float> latent = arr.to_vector<float>();
+  const Products products = decoder.conv_products();
   std::printf("\n%s: decode %ux%u (latents %ux%u), %s, decode allocates %.3f GiB, %.2f GiB free\n", name.c_str(), 16 * w, 16 * h, h,
-              w, hip_vae::products_name(o.conv_products), static_cast<double>(decoder.workspace_bytes(h, w)) / (1u << 30),
+              w, hip_vae::products_name(products), static_cast<double>(decoder.workspace_bytes(h, w)) / (1u << 30),
               static_cast<double>(device.free_memory()) / (1u << 30));
   std::vector<std::uint8_t> rgb;
   std::vector<float> image;
@@ -1249,10 +1283,15 @@ void run_decode(Device& device, VaeDecoder& decoder, const Options& o, const std
   }
   const double n = static_cast<double>(rgb.size()), mse = se / n, identical = static_cast<double>(same) / n;
   const double psnr = mse == 0.0 ? INFINITY : 10.0 * std::log10(255.0 * 255.0 / mse);
-  const bool ok = nans == 0 && max_abs <= 1 && identical >= 0.99;
+  const bool one_operand = products == Products::kFp16 || products == Products::kBf16;
+  const int max_allowed = one_operand ? 8 : 1;
+  const double min_identical = one_operand ? 0.80 : 0.99;
+  const bool ok = nans == 0 && max_abs <= max_allowed && identical >= min_identical;
   if (!ok) ++failures;
+  const char* gate = one_operand ? "no NaN, max |diff| <= 8, >= 80 % identical (one 16-bit operand)"
+                                 : "no NaN, max |diff| <= 1, >= 99 % identical";
   std::printf("  against %s: %s\n    PSNR %.2f dB, max |diff| %d, mean |diff| %.5f, identical bytes %.4f %%, decoder output NaN %zu\n",
-              png.string().c_str(), ok ? "ok" : "FAILED (gate: no NaN, max |diff| <= 1, >= 99 % identical)", psnr, max_abs,
+              png.string().c_str(), ok ? "ok" : (std::string("FAILED (gate: ") + gate + ")").c_str(), psnr, max_abs,
               sum_abs / n, 100.0 * identical, nans);
   std::printf("    |diff| 0: %zu, 1: %zu, 2: %zu, >= 3: %zu bytes\n", hist[0], hist[1], hist[2], hist[3]);
 }
@@ -1350,6 +1389,56 @@ void run_nonsquare(VaeDecoder& decoder, const Options& o) {
   }
 }
 
+// The exact band-tiled path against the full decode on the same latents. Random latents exercise the whole tail;
+// nothing here needs the golden files. Every schedule must give byte-identical RGB (the fp32 image before the clamp
+// is compared as well, as a stronger diagnostic).
+void run_tiled_exact_check(VaeDecoder& decoder) {
+  std::printf("\nexact band-tiled decode: the same latents, full vs band-tiled (RGB must be byte-identical)\n");
+  struct Case {
+    std::uint32_t h, w;
+    std::vector<int> tiles;
+  };
+  const Case cases[] = {{8, 8, {16, 40, 64, 128}}, {6, 10, {16, 40, 96}}, {16, 16, {32, 48, 256}}};
+  const int c = decoder.base_channels();
+  for (const Case& cs : cases) {
+    const std::vector<float> z = random_f32(1000 + cs.h * 100 + cs.w, 128ull * cs.h * cs.w, -2.0f, 2.0f);
+    std::vector<std::uint8_t> rgb_full;
+    std::vector<float> image_full;
+    decoder.decode(z.data(), cs.h, cs.w, rgb_full, &image_full);
+    std::printf("  latents %ux%u -> image %ux%u, full decode workspace %.3f GiB\n", cs.h, cs.w, 16 * cs.w, 16 * cs.h,
+                static_cast<double>(decoder.workspace_bytes(cs.h, cs.w)) / (1u << 30));
+    for (const int tile : cs.tiles) {
+      for (int planner = 0; planner < 2; ++planner) {
+        const VaeTilePlan plan = planner == 0 ? VaeDecoder::plan_tiled_min_memory(c, cs.h, cs.w, tile)
+                                               : VaeDecoder::plan_tiled_uniform(c, cs.h, cs.w, tile);
+        std::vector<std::uint8_t> rgb;
+        std::vector<float> image;
+        decoder.decode_tiled_exact(z.data(), cs.h, cs.w, rgb, plan, &image);
+        // Compare sizes before indexing: a decoder returning the wrong shape must fail cleanly, not read past
+        // the full-frame result vectors.
+        const bool sizes_ok = rgb.size() == rgb_full.size() && image.size() == image_full.size();
+        std::size_t bad_bytes = 0, bad_image = 0;
+        double max_diff = 0.0;
+        if (sizes_ok) {
+          for (std::size_t i = 0; i < rgb.size(); ++i) bad_bytes += rgb[i] != rgb_full[i];
+          for (std::size_t i = 0; i < image.size(); ++i) {
+            bad_image += std::bit_cast<std::uint32_t>(image[i]) != std::bit_cast<std::uint32_t>(image_full[i]);
+            max_diff = std::max(max_diff, std::abs(static_cast<double>(image[i] - image_full[i])));
+          }
+        } else {
+          bad_bytes = rgb_full.size() + rgb.size() + 1;
+          bad_image = image_full.size() + image.size() + 1;
+        }
+        const bool ok = sizes_ok && bad_bytes == 0 && bad_image == 0;
+        if (!ok) ++failures;
+        std::printf("  %-9s %-8s %s: %s %zu of %zu bytes differ, %zu of %zu fp32 values differ (max |diff| %.3g)\n",
+                    planner == 0 ? "min-mem" : "uniform", ("tile " + std::to_string(tile)).c_str(), plan.describe().c_str(),
+                    ok ? "ok" : "FAILED", bad_bytes, rgb_full.size(), bad_image, image_full.size(), max_diff);
+      }
+    }
+  }
+}
+
 // The size limits: refused before anything runs, with the reason.
 void check_limits(Device& device, const VaeDecoder& decoder) {
   const auto expect_refused = [&](const char* what, std::uint32_t h, std::uint32_t w) {
@@ -1403,14 +1492,17 @@ int main(int argc, char** argv) {
       else if (arg == "--profile") o.profile = true;
       else if (arg == "--conv-products") {
         const std::string v = next();
-        if (v != "4" && v != "3") throw std::invalid_argument("--conv-products takes 4 or 3");
-        o.conv_products = v == "4" ? Products::kTf32 : Products::kTf32Drop;
+        if (v != "4" && v != "3" && v != "1") throw std::invalid_argument("--conv-products takes 4, 3 or 1");
+        o.conv_products = v == "4" ? Products::kTf32 : (v == "3" ? Products::kTf32Drop : Products::kFp16);
+        o.conv_products_set = true;
+      } else if (arg == "--tiled-check") {
+        o.tiled_check = true;
       } else {
         throw std::invalid_argument("unknown argument " + arg);
       }
     } catch (const std::exception& e) {
       std::printf("%s\nusage: %s [--device N] [--kat-only | --no-kat] [--vae FILE] [--golden DIR] [--case NAME]... [--no-golden] [--no-nonsquare]\n"
-                  "       [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3]\n",
+                  "       [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3|1] [--tiled-check]\n",
                   e.what(), argv[0]);
       return 2;
     }
@@ -1433,7 +1525,7 @@ int main(int argc, char** argv) {
     if (o.decode) {
       const auto t0 = std::chrono::steady_clock::now();
       VaeDecoder decoder(device, o.vae);
-      decoder.set_conv_products(o.conv_products);
+      if (o.conv_products_set) decoder.set_conv_products(o.conv_products);
       decoder.set_profile(o.profile);
       std::printf("\nweights: %.1f MB on the device (decoder c = %d), loaded in %.2f s; decode workspace at 1024^2 %.2f GiB, "
                   "1456^2 %.2f GiB, 2048^2 %.2f GiB\n",
@@ -1445,6 +1537,7 @@ int main(int argc, char** argv) {
       check_limits(device, decoder);
       for (const std::string& name : o.cases) run_decode(device, decoder, o, name);
       if (o.nonsquare) run_nonsquare(decoder, o);
+      if (o.tiled_check) run_tiled_exact_check(decoder);
     }
     std::printf("\n%s (%d failed checks)\n", failures == 0 ? "PASS" : "FAIL", failures);
     return failures == 0 ? 0 : 1;

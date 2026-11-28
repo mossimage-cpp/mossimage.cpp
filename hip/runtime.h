@@ -31,6 +31,10 @@ struct DeviceInfo {
 // Every device the HIP runtime sees, usable or not. Empty when there is none or no driver.
 std::vector<DeviceInfo> list_devices();
 
+// True when the current device is RDNA2 (gfx1030..gfx1036): no matrix cores and no bf16 instructions, so the build's
+// dot-product leaves (int8 v_dot4_i32_i8, bf16-as-fp16 v_dot2_f32_f16) run there instead of the WMMA ones.
+bool device_is_rdna2();
+
 // The device a process runs on: made current at construction (hipSetDevice).
 class Device {
  public:
@@ -130,7 +134,6 @@ class Event {
   Event(const Event&) = delete;
   Event& operator=(const Event&) = delete;
 
-  hipEvent_t get() const { return e_; }
   void record(hipStream_t stream);
   // Makes `stream` wait on the device for this event's last record.
   void wait(hipStream_t stream) const;

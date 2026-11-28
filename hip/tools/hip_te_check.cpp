@@ -11,20 +11,10 @@
 // threshold would not do there: on the 4096-token prompt torch's swapped attention alone decorrelates whole rows (row
 // relative L2 0.96).
 //
-// The factor is the engine test's off-reference 2.5, not its 2.0. The engine is held to 2.0 on sm_89 because its
-// cuBLASLt GEMMs and FlashAttention-2 round like torch's own kernels there: its layer 0 is almost torch's (mean row
-// relative L2 5e-5). The HIP GEMMs and attention are a different MMA family (v_wmma on AMD, the scalar leaf in the
-// nvidia build), whose summation order cannot reproduce NVIDIA's tensor cores, which is the situation of a different
-// GPU. On the nvidia build every other op is bit-exact with the engine on the engine's inputs (norms, conv, gates, the
-// gated delta rule, the gated norm, q/k norm + RoPE, the output gate; on AMD their exp, rsqrt and log1p are OCML's, so
-// not by construction there), and the GEMMs and attention are as accurate as the engine's against fp64 (relative L2
-// 1.7222e-3 both for a GEMM, 1.7006e-3 vs 1.7009e-3 for attention); they start about 10 times farther from torch's
-// trajectory at layer 0 (5.3e-4), which the 32 layers amplify. On the RTX 4090 Laptop,
-// g_long4096_1024.cond, as factors of the floor in 1 - cosine:
-//   CUDA engine        layer 31 cos 0.9993189 (1.77x), last_hidden cos 0.9986887 (1.67x), mean row rel-L2 1.16x
-//   HIP, nvidia build  layer 31 cos 0.9990446 (2.48x), last_hidden cos 0.9984760 (1.94x), mean row rel-L2 1.19x
-// Both have rows decorrelated from the golden there (worst row cosine 0.37 engine, 0.45 HIP). The AMD gate is the same
-// 2.5, fixed before any card run: a card past it is investigated, the factor is not retuned.
+// The factor is the engine test's off-reference 2.5, not its 2.0: the HIP GEMMs and attention are a different MMA
+// family (v_wmma or RDNA2 dot products on AMD, the scalar leaf in the nvidia build), so their summation order cannot
+// reproduce torch's tensor cores. Small per-layer differences grow over 32 layers. The gate is fixed; a device past it
+// is investigated rather than retuning the factor.
 //
 // --iters repeats the call for timing; --time-ops prints device milliseconds per kind of op; --row-major runs the GEMMs
 // on row-major operands; --prefix N encodes at most the first N tokens of each sequence (compared with the golden's
@@ -154,7 +144,7 @@ std::vector<float> golden(const std::string& dir, const std::string& key, const 
 int main(int argc, char** argv) {
   int device_index = -1, iters = 1;
   TextEncoderOptions options;
-  std::string weights = "/workspace/Models/MOSS-Image/base/text_encoder", golden_dir = "tests/golden", dump;
+  std::string weights = "models/MOSS-Image/text_encoder", golden_dir = "tests/golden", dump;
   std::string floor_file = "tests/data/qwen35_text/noise_floor.json";
   std::size_t prefix = 0;
   bool solo = false;
@@ -174,7 +164,10 @@ int main(int argc, char** argv) {
     } else if (arg == "--time-ops") {
       options.time_ops = true;
     } else if (arg == "--row-major") {
+      // The tiled GEMM is the default and wins regardless of `packed`; to actually compare the legacy operands both
+      // switches have to be off.
       options.packed = false;
+      options.tiled_gemm = false;
     } else if (arg == "--noise-floor" && i + 1 < argc) {
       floor_file = argv[++i];
     } else if (arg == "--prefix" && i + 1 < argc) {
@@ -219,8 +212,8 @@ int main(int argc, char** argv) {
     Device device(device_index);
     TextEncoder encoder(device, weights, options);
     std::printf("device %d: %s (%s), build %s, GEMMs on %s operands; %zu sequences in one call\n", device.info().index,
-                device.info().name.c_str(), device.info().arch.c_str(), build_target(), options.packed ? "packed" : "row-major",
-                seqs.size());
+                device.info().name.c_str(), device.info().arch.c_str(), build_target(),
+                options.tiled_gemm ? "tiled" : (options.packed ? "packed" : "row-major"), seqs.size());
     std::map<int, std::vector<std::uint16_t>> layers;
     const TeLayerHook hook = [&](int layer, const std::uint16_t* hidden, std::uint32_t tokens, hipStream_t stream) {
       if (layer != 0 && layer != 3 && layer != 31 && dump.empty()) return;

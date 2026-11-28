@@ -11,7 +11,7 @@
 //   - silu's and situ_glu's outputs: on the NVIDIA build (whose exp and tanh are CUDA's) every output with the replay's
 //     bits; on AMD at least 99 % of them and none further than 3 ULPs of max(|replay|, the output's rms), as AMD's math
 //     library may differ from the host's in a low bit that a rounding point carries into an output (3 ULPs is
-//     tools/hip_block's limit for the same effect in its norms).
+//     the tolerance used for the same effect in the norms checks).
 //   - rope_table against a replay of rope.cu's expressions with the host's sinf and cosf: at least 99.9 % of the values with
 //     its bits and none further than 1 ULP, on every device (the replay's sinf is not the device's, so not exact). That
 //     checks the coordinates and the layout; on the NVIDIA build the kernel's expressions are the engine's.

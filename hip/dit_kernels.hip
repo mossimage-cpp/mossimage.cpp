@@ -149,7 +149,7 @@ void launch_gemm(const char* op, bf16_bits* out, std::int64_t ldo, const bf16_bi
                  std::int64_t ldw, const bf16_bits* bias, int m, int n, int k, hipStream_t stream) {
   if (m == 0 || n == 0) return;
   const Blocking bl = blocking_of(m, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{out, ldo, x, ldx, w, ldw, bias, m, n, k, bl.bm, bl.bn, nullptr, nullptr};
+  const GemmArgs a{out, ldo, x, ldx, w, ldw, bias, m, n, k, bl.bm, bl.bn, nullptr, nullptr, nullptr, 0};
   gemm_kernel<kEpilogue><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch(op);
 }
