@@ -1,4 +1,4 @@
-// 8-bit attention on sm_75 (`q8_fp16` / `q8_fp16_f32acc`): INT8 QK^T with Turing's m8n8k16 MMA and fp16 P·V with the
+// 8-bit attention on sm_75 (`q8_fp16` / `q8_fp16_f32acc`): INT8 QK^T with native DP4A and fp16 P·V with the
 // existing m16n8k8 path. q and k are quantized per row (amax / 127) in a pre-pass; k is not mean-smoothed (the engine's
 // q8 is lossy by definition, and the smoothing only buys INT8 range). v becomes fp16. The tiling, online softmax and
 // P·V reuse the exact kernel's (attention_sm75.cu): 64 queries per CTA, 4 warps, 16 rows per warp, 32 keys per tile.
@@ -26,11 +26,11 @@ constexpr int kQ8Chunks = kQ8D / 16;     // m8n8k16 in-dimension chunks (QK^T)
 constexpr int kQ8PvChunks = kQ8D / 8;   // m16n8k8 in-dimension chunks (P·V)
 constexpr float kLog2e = 1.4426950408889634f;
 
-// m8n8k16 int8 -> int32 MMA (Turing). a = 4 int8 of one query row, b = 4 int8 of one key, d = 2 int32.
-__device__ __forceinline__ void mma_m8n8k16(int& d0, int& d1, std::uint32_t a, std::uint32_t b) {
-  asm volatile("mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
-               : "+r"(d0), "+r"(d1)
-               : "r"(a), "r"(b));
+// Native int8 dot product (four signed bytes per instruction) for cards without tensor cores.
+__device__ __forceinline__ int dp4a_i8(int a, int b, int c) {
+  int d = 0;
+  asm volatile("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  return d;
 }
 
 __device__ __forceinline__ void mma_m16n8k8(float (&d)[4], std::uint32_t a0, std::uint32_t a1, std::uint32_t b) {
@@ -125,6 +125,9 @@ __global__ void attention_q8_kernel(const Q8Params p) {
   __shared__ __align__(16) std::int8_t ks[kQ8BN * kQ8Stride];
   __shared__ __align__(16) __half vt[kQ8D * (kQ8BN + 8)];
   __shared__ float kscale[kQ8BN];
+  // Full query tile as 32 int32 words per row, loaded once per CTA. mma.sync exchanges K quartets across lanes;
+  // dp4a has no such exchange, so each thread reads all 128 dims of the two query rows it owns.
+  __shared__ std::uint32_t qs[kQ8BM][kQ8Chunks * 4];
   const int batch = blockIdx.y, head = blockIdx.z;
   const int q_start = p.cu_q[batch], q_end = p.cu_q[batch + 1];
   const int k_start = p.cu_k[batch], k_end = p.cu_k[batch + 1];
@@ -137,18 +140,13 @@ __global__ void attention_q8_kernel(const Q8Params p) {
   const int group = lane >> 2, tig = lane & 3;
   const int r0 = warp * 16 + group, r1 = r0 + 8;
 
-  // Q fragments: 4 int8 of one query row per chunk; two row groups per lane-pair.
-  std::uint32_t qf[2][kQ8Chunks];
   const std::int64_t q_head_off = static_cast<std::int64_t>(head) * p.q_head;
-  const auto load_q = [&](int row, int chunk) -> std::uint32_t {
-    if (row >= rows) return 0u;
-    return load_u32(p.q + static_cast<std::int64_t>(q_start + row_base + row) * p.q_row + q_head_off + chunk * 16 + tig * 4);
-  };
-#pragma unroll
-  for (int i = 0; i < kQ8Chunks; ++i) {
-    qf[0][i] = load_q(r0, i);
-    qf[1][i] = load_q(r1, i);
+  for (int idx = tid; idx < kQ8BM * kQ8Chunks * 4; idx += kQ8Warps * 32) {
+    const int r = idx / (kQ8Chunks * 4), w = idx % (kQ8Chunks * 4);
+    qs[r][w] = r < rows ? load_u32(p.q + static_cast<std::int64_t>(q_start + row_base + r) * p.q_row + q_head_off + w * 4)
+                        : 0u;
   }
+  __syncthreads();
   const float sq0 = r0 < rows ? p.q_scale[(q_start + row_base + r0) * p.heads + head] : 1.f;
   const float sq1 = r1 < rows ? p.q_scale[(q_start + row_base + r1) * p.heads + head] : 1.f;
 
@@ -179,12 +177,21 @@ __global__ void attention_q8_kernel(const Q8Params p) {
 #pragma unroll
     for (int t = 0; t < kSubtiles; ++t) {
       int a0 = 0, a1 = 0, b0 = 0, b1 = 0;
-      const int key = t * 8 + group;
+      // QKᵀ: each thread owns two query rows and two adjacent key rows. Native dp4a performs four int8 MACs per
+      // instruction, so sum all 128 K dims (four words per chunk) into the four int32 accumulators.
+      const int key_a = t * 8 + 2 * tig, key_b = key_a + 1;
 #pragma unroll
       for (int i = 0; i < kQ8Chunks; ++i) {
-        const std::uint32_t kb = load_u32(&ks[key * kQ8Stride + i * 16 + tig * 4]);
-        mma_m8n8k16(a0, a1, qf[0][i], kb);
-        mma_m8n8k16(b0, b1, qf[1][i], kb);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int wa = static_cast<int>(qs[r0][i * 4 + j]), wb = static_cast<int>(qs[r1][i * 4 + j]);
+          const int ka = static_cast<int>(load_u32(&ks[key_a * kQ8Stride + i * 16 + j * 4]));
+          const int kb = static_cast<int>(load_u32(&ks[key_b * kQ8Stride + i * 16 + j * 4]));
+          a0 = dp4a_i8(wa, ka, a0);
+          a1 = dp4a_i8(wa, kb, a1);
+          b0 = dp4a_i8(wb, ka, b0);
+          b1 = dp4a_i8(wb, kb, b1);
+        }
       }
       const float sk0 = kscale[t * 8 + 2 * tig] * p.scale;
       const float sk1 = kscale[t * 8 + 2 * tig + 1] * p.scale;

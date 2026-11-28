@@ -34,6 +34,7 @@
 #include "kernels/fused/qk_norm_rope.h"
 #include "kernels/lora/lora_gemm.h"
 #include "kernels/quant/quant.h"
+#include "kernels/sm75/sm75.h"
 #include "models/lora/lora.h"
 #include "models/lora/side_branch.h"
 #include "test_lora_util.h"
@@ -58,6 +59,10 @@ bool has_gpu() {
   int n = 0;
   return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
 }
+
+// These tests exercise the sm_80+ fused LoRA GEMMs; sm_7x runs runtime LoRAs as the fp32 side branch instead.
+#define REQUIRE_NO_SM7X()                                                              \
+  if (mi::kernels::sm75::turing()) GTEST_SKIP() << "fused LoRA GEMMs need sm_80+"
 
 const fs::path data_dir() { return fs::path(MOSSINFER_SOURCE_DIR) / "tests/data/lora"; }
 
@@ -218,7 +223,7 @@ struct Acts {
     cu = Dev(mi::DType::kI32, {static_cast<std::int64_t>(cu_host.size())}, cu_host.data());
     for (std::size_t i = 1; i < cu_host.size(); ++i) max_seqlen = std::max(max_seqlen, cu_host[i] - cu_host[i - 1]);
     lse = Dev(mi::DType::kU8, {static_cast<std::int64_t>(attention::flash_fwd_workspace_bytes(rows, kHeads))});
-    tws = Dev(mi::DType::kU8, {static_cast<std::int64_t>(t_workspace_bytes(rows, r))});
+    tws = Dev(mi::DType::kU8, {static_cast<std::int64_t>(t_workspace_bytes(rows, kF, r))});
     tb = Dev(mi::DType::kBF16, {rows, r});
     q8 = Dev(mi::DType::kI8, {rows, kF});
     s8 = Dev(mi::DType::kF32, {rows});
@@ -371,6 +376,7 @@ U16 run_real_bf16(Ctx& c, const RealSetup& r, const Bf16Block& w, const SideBran
 
 TEST(LoraBlock, Bf16SideBranchMatchesFp32MergedReference) {
   if (!has_gpu()) GTEST_SKIP() << "no CUDA device";
+  REQUIRE_NO_SM7X();
   if (const std::string m = missing_inputs(); !m.empty()) GTEST_SKIP() << m;
   const RealSetup r = load_real();
   const Bf16Block w = load_bf16_block(*r.sft);
@@ -434,6 +440,7 @@ TEST(LoraBlock, Bf16SideBranchMatchesFp32MergedReference) {
 
 TEST(LoraBlock, StrengthZeroIsBitIdentical) {
   if (!has_gpu()) GTEST_SKIP() << "no CUDA device";
+  REQUIRE_NO_SM7X();
   if (const std::string m = missing_inputs(); !m.empty()) GTEST_SKIP() << m;
   const RealSetup r = load_real();
   const Bf16Block w = load_bf16_block(*r.sft);
@@ -480,6 +487,7 @@ TEST(LoraBlock, StrengthZeroIsBitIdentical) {
 // ULPs of Δ.
 TEST(LoraBlock, Int8SideBranchEqualsReferenceMath) {
   if (!has_gpu()) GTEST_SKIP() << "no CUDA device";
+  REQUIRE_NO_SM7X();
   if (const std::string m = missing_inputs(); !m.empty()) GTEST_SKIP() << m;
   if (!fs::exists(tl::kInt8File)) GTEST_SKIP() << "absent: " << tl::kInt8File;
   const quant::QuantModel qm = quant::open_quant_model(tl::kInt8File);
@@ -590,6 +598,7 @@ TEST(LoraBlock, Int8SideBranchEqualsReferenceMath) {
 // plus the LoRA effect.
 TEST(LoraBlock, Int8BlockWithLoras) {
   if (!has_gpu()) GTEST_SKIP() << "no CUDA device";
+  REQUIRE_NO_SM7X();
   if (const std::string m = missing_inputs(); !m.empty()) GTEST_SKIP() << m;
   if (!fs::exists(tl::kInt8File)) GTEST_SKIP() << "absent: " << tl::kInt8File;
   const RealSetup r = load_real();
@@ -634,6 +643,7 @@ TEST(LoraBlock, Int8BlockWithLoras) {
 // compute_t and the unfused norm; known improvements: a norm + rotate kernel that also stores the bf16 output, and an
 // FP8 rank product. The assertions below are those measured bounds plus noise margin.
 TEST(LoraBlock, OverheadAt1024) {
+  REQUIRE_NO_SM7X();
   if (std::getenv("MI_LORA_BENCH") == nullptr) GTEST_SKIP() << "set MI_LORA_BENCH=1";
   if (!has_gpu()) GTEST_SKIP() << "no CUDA device";
   if (!fs::exists(tl::kSft)) GTEST_SKIP() << "absent: " << tl::kSft;

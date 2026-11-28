@@ -175,7 +175,9 @@ bool turing_q8_kernel() { return kernels::sm75::turing() && !kernels::sm70::volt
 }  // namespace
 
 bool supported(Variant v) {
-  if (turing_q8_kernel()) return v == Variant::kInt8Fp16 || v == Variant::kInt8Fp16F32Acc;
+  if (turing_q8_kernel()) {
+    return v == Variant::kInt8Fp16 || v == Variant::kInt8Fp16F32Acc;
+  }
   int device = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
   return support(device, v) == Support::kOk;

@@ -962,28 +962,35 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // Quality tier from what is loaded, before anything heavy (its refusals throw std::invalid_argument here, ahead of
     // the LoRA files too). The lossy accelerators are an explicit speed opt-in: the tier is resolved without them.
     const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
-    // sm_7x: the caller's unset attention resolves to exact instead of an 8-bit default. Volta has no 8-bit attention
-    // kernel; Turing's q8_fp16 (kernels/sm75/attention_q8_sm75.cu) runs when asked for, but is no faster than exact
-    // there (Turing's INT8 MMA does the fp16 MMA's MACs per instruction), so it is never the default. Keyed on the
-    // device, not on the kernels' availability: an sm_80+ build without them (MOSSINFER_ONLY) still refuses, as before.
-    const bool exact_when_no_q8 = kernels::sm75::turing();
-    const bool attention_given = m.options.attention.has_value();
+    // Like every other architecture, an unset attention resolves to the tier's 8-bit default. Turing's q8 path now
+    // uses native DP4A for QK (kernels/sm75/attention_q8_sm75.cu), so q8_fp16 is both supported and the default there;
+    // Volta has no 8-bit kernel and keeps its explicit exact fallback. Keyed on the kernels' availability: an sm_80+
+    // build without them (MOSSINFER_ONLY) still refuses, as before.
     const auto supported = [&](planner::AttentionMode mode) {
-      if (exact_when_no_q8 && !attention_given && planner::is_q8(mode)) return false;
       return moss_dit::attention_supported(dit_attention(mode));
     };
-    // sm_75 has no LoRA side-branch kernels, so run() forces every adapter to merge (Pipeline::run, above); INT4
-    // ConvRot weights have no merge path (merges need bf16 or INT8 ConvRot), and the tier's own advice ("use
-    // lora_placement side_branch") does not exist on Turing: refuse here with what does work.
-    if (lora_requested && exact_when_no_q8 && src.precision == planner::Precision::kInt4) {
+    const bool no_default_q8 =
+        !supported(planner::AttentionMode::kQ8Fp8) && !supported(planner::AttentionMode::kQ8Fp16);
+    // Turing's LoRA side branch only handles INT8 ConvRot weights; INT4 ConvRot blocks have no sm_75 side-branch
+    // path (and no merge path), so the turbo tier stays refused with LoRAs. Independent of the attention default.
+    if (lora_requested && kernels::sm75::turing() && src.precision == planner::Precision::kInt4) {
       throw std::invalid_argument(
-          "runtime LoRAs cannot run on the turbo tier on sm_7x: its INT4 ConvRot weights have no merge path and Turing "
-          "has no LoRA side-branch kernels; use tier high (INT8 ConvRot) or tier reference");
+          "runtime LoRAs cannot run on the turbo tier on sm_7x: its INT4 ConvRot weights have no sm_75 side-branch "
+          "path and no merge path; use tier high (INT8 ConvRot) or tier reference");
     }
-    r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, supported,
+    // sm_75's q8 pre-pass stages q/k/v for every token, so at large latents its plan can exceed the dedicated-VRAM
+    // arena. In strict budget mode an unset attention then falls back to exact; with the default soft budget the plan
+    // is kept with a warning and the runtime spills into shared GPU memory instead.
+    const std::int64_t latent_tokens = (req.height / 16) * (static_cast<std::int64_t>(req.width) / 16);
+    const bool q8_too_big = kernels::sm75::turing() && !m.options.attention.has_value() && latent_tokens > 5000 &&
+                            !planner::soft_vram_budget();
+    const std::optional<planner::AttentionMode> attention_choice =
+        q8_too_big ? std::optional<planner::AttentionMode>(planner::AttentionMode::kExact) : m.options.attention;
+    r.tier = planner::resolve_tier(m.options.tier, attention_choice, src.precision, supported,
                                    tes.precision != qwen35_text::Precision::kBF16,
                                    src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available(),
-                                   exact_when_no_q8);
+                                   no_default_q8);
+    if (q8_too_big) r.tier.reason += "; q8 workspace does not fit this resolution, using exact";
     if (lora_requested) r.tier.reason += "; runtime LoRAs active";
     if (req.accel.step_cache_on()) {
       // An unset threshold takes the model's default (0.02 on the base model, told apart by its DiT's input embedder:
@@ -1350,6 +1357,10 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
     r.plan = planned();
     drop_resident = true;
   }
+  if (planner::soft_vram_budget() &&
+      r.plan.explanation.find("WARNING (soft VRAM budget)") != std::string::npos) {
+    r.tier.reason += "; WARNING: VRAM budget exceeded, running on shared GPU memory";
+  }
   // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading
   // it costs: no reload churn when request sizes alternate or the free device memory moves a little.
   bool kept = false;
@@ -1540,18 +1551,12 @@ void Pipeline::Impl::explain_control(const Request::Control& control, Result& r)
 
 // Features that still need sm_80+ kernels are refused on Turing before anything is planned, read or uploaded (by
 // Pipeline::run, and by a Session for its options and every run's spec): control adapters (a LoRA with a replacement
-// embedding, fused into the block GEMMs). The VAE encoder runs on Turing (fp32 SIMT), and runtime LoRAs are merged at
-// load (Pipeline::run sets the placement).
-void detail::force_lora_merge_on_sm7x(Request& req) {
-  // The load-time merge runs in bf16 and the fp16 conversion follows it, as for the bf16 bundle.
-  if (kernels::sm75::turing() && !req.loras.empty()) req.lora_placement = lora::Placement::kMerge;
-}
-
+// embedding, fused into the block GEMMs). The VAE encoder runs on Turing (fp32 SIMT).
 void detail::refuse_unsupported_on_sm7x(const Request& req) {
   if (!kernels::sm75::turing()) return;
   // The VAE encoder runs on Turing (fp32 SIMT convs, the same kernels as the decoder), so img2img, inpainting,
-  // reference images and the hires fix all work. Runtime LoRAs are merged into the weights instead of the sm_80+ fused
-  // side branches (Pipeline::run sets the placement); control adapters still need the fused LoRA path.
+  // reference images and the hires fix all work. Runtime LoRAs use the sm_75 side branch; control adapters still need
+  // the fused LoRA path.
   if (req.control.enabled()) {
     throw NotSupportedError("control adapters are LoRAs and need sm_80+ GEMM kernels; this sm_7x build cannot run them");
   }
@@ -1560,7 +1565,6 @@ void detail::refuse_unsupported_on_sm7x(const Request& req) {
 Result Pipeline::run(const Request& request, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
   Request req = request;
-  force_lora_merge_on_sm7x(req);
   check_user_paths(m.options, req);
   validate(req);
   refuse_unsupported_on_sm7x(req);

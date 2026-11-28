@@ -38,6 +38,12 @@ class Gemm {
   void linear(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, void* workspace,
               std::size_t workspace_bytes, cudaStream_t stream);
 
+  // out = x · wᵀ with fp32 operands (no bias). On Turing without tensor cores cuBLASLt's fp32 kernels reach
+  // ~1.5 TFLOPS where its fp16 kernels reach only ~0.3, so small-K side-branch GEMMs use this path.
+  // out: bf16 or f32 [..., N]; x: f32 [..., K]; w: f32 [N, K], all with one row stride.
+  void linear_f32(const Tensor& out, const Tensor& x, const Tensor& w, void* workspace, std::size_t workspace_bytes,
+                  cudaStream_t stream);
+
   // The cuBLASLt algorithm configuration (CUBLASLT_ALGO_CONFIG_*) linear() selects for these operands. Plans and
   // caches exactly as linear() does (the same plan is then launched); launches nothing and never reads the operands'
   // contents, only their shapes, strides and address alignment. Lets callers check whether another kernel reproduces

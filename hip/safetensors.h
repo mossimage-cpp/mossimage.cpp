@@ -29,6 +29,8 @@ class File {
 
   const std::string& path() const { return path_; }  // UTF-8, for messages
   const std::vector<TensorInfo>& tensors() const { return tensors_; }
+  // File-level `__metadata__` value, or null when the key is absent.
+  const std::string* metadata(const std::string& key) const;
   const TensorInfo* find(const std::string& name) const;  // null if absent
   const TensorInfo& at(const std::string& name) const;    // throws if absent
 
@@ -48,13 +50,21 @@ class File {
 // model.safetensors.index.json's weight_map: tensor name -> shard file name (relative to the index's directory).
 std::map<std::string, std::string> read_index(const std::filesystem::path& path);
 
-// The tensors of one file, or of every shard of a model directory, by name.
+// `_quantization_metadata`'s layers: canonical module name -> ConvRot group of the modules stored as INT8 ConvRot.
+// Other formats and unrotated modules are left out; the caller validates the group before using it.
+std::map<std::string, int> convrot_groups(const std::string& json);
+
+
+// The tensors of one file, or of every shard of a model directory, by name. DiT tensor names are canonicalized:
+// a `model.diffusion_model.` / `diffusion_model.` prefix is stripped, as the CUDA backend does.
 class Index {
  public:
   // A .safetensors file, or a directory holding one *.safetensors.index.json (its shards) or exactly one .safetensors.
   explicit Index(const std::filesystem::path& path);
 
   bool has(const std::string& name) const { return tensors_.count(name) != 0; }
+  // File-level `__metadata__` value from any of the shards, or null when absent.
+  const std::string* metadata(const std::string& key) const;
   const TensorInfo& at(const std::string& name) const;  // throws if absent
   // Reads a whole tensor into caller memory of exactly its size, or throws.
   void read_into(const std::string& name, void* out, std::uint64_t bytes) const;

@@ -50,6 +50,7 @@
 #include "kernels/fused/qk_norm_rope.h"
 #include "kernels/nvfp4/nvfp4.h"
 #include "kernels/quant/quant.h"
+#include "kernels/sm75/sm75.h"
 #include "models/lora/lora.h"
 #include "models/lora/side_branch.h"
 #include "models/moss_dit/dit_block_fused.h"
@@ -80,6 +81,10 @@ constexpr std::int64_t kD = md::kDim, kF = md::kFfnDim, kH = md::kHeads, kHd = m
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 constexpr int kBlock = 5;
 const float kScale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHd)));
+
+// The LoRA tests build bf16 t and call the sm_80+ fused LoRA GEMMs; sm_7x uses the fp32 side branch instead.
+#define REQUIRE_NO_SM7X()                                                              \
+  if (mi::kernels::sm75::turing()) GTEST_SKIP() << "LoRA side-branch tests need sm_80+"
 
 fs::path env_path(const char* var, const char* fallback) {
   const char* env = std::getenv(var);
@@ -407,7 +412,7 @@ struct BlockCall {
     qa.nvfp4_sf_bytes = sf.size();
     if (lora != nullptr) {
       lora_t = std::make_unique<DevTensor>(DType::kBF16, std::initializer_list<std::int64_t>{l, lora->max_rank()});
-      lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, lora->max_rank()));
+      lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, kF, lora->max_rank()));
       delta = std::make_unique<DevTensor>(DType::kBF16, std::initializer_list<std::int64_t>{l, 2 * kF});
       scratch = mi::DeviceBuffer(mi::lora::delta_scratch_bytes(l, lora->max_rank(), 2 * kF));
       qa.lora = lora;
@@ -475,7 +480,7 @@ struct HostLora {
 std::vector<float> engine_delta(const mi::lora::SiteBranch& site, const Tensor& in, bool natural, cudaStream_t s) {
   const std::int64_t l = in.dim(0);
   mi::kernels::Gemm gemm;
-  mi::DeviceBuffer gws(mi::kernels::Gemm::kWorkspaceBytes), tws(mi::lora::t_workspace_bytes(l, site.rank)),
+  mi::DeviceBuffer gws(mi::kernels::Gemm::kWorkspaceBytes), tws(mi::lora::t_workspace_bytes(l, site.k, site.rank)),
       scratch(mi::lora::delta_scratch_bytes(l, site.rank, site.n));
   DevTensor t(DType::kBF16, {l, site.rank}), d(DType::kBF16, {l, site.n});
   mi::lora::compute_t(site, in, t.t, tws.get(), tws.size(), gemm, gws.get(), gws.size(), s);
@@ -738,6 +743,7 @@ fs::path write_lora(const std::string& file, std::span<const LoraMod> mods, bool
 //     (bf16 t and Delta summed in another order: within 2 ULP); and the block against the emulation with the factors'
 //     Delta, reported (a last-bit difference of Delta before a 4-bit re-quantization can move a value a whole step).
 TEST_F(GpuDitNvfp4Block, RuntimeLora) {
+  REQUIRE_NO_SM7X();
   const LoraMod all[] = {{"q", kD, kD}, {"k", kD, kD}, {"v", kD, kD}, {"o", kD, kD}, {"ffn_up_gate", 2 * kF, kD},
                          {"ffn_down", kD, kF}};
   const mi::lora::LoraSpec zero_spec{write_lora("zero.safetensors", all, true, nullptr), 1.0f};
@@ -1130,6 +1136,7 @@ TEST_F(GpuDitNvfp4Model, StreamedBitIdenticalToResident) {
 // uncond skipping block 22) on an NVFP4 file: the same bits twice, CUDA graphs == eager, and it changes the output
 // (cosine to the plain model reported). The keep-list INT8 sites run the fused INT8 LoRA GEMMs beside the NVFP4 ones.
 TEST(GpuDitNvfp4Lora, Model1024) {
+  REQUIRE_NO_SM7X();
   if (!nvfp4_here()) GTEST_SKIP() << "the NVFP4 GEMMs do not run here";
   if (nvfp4_files().empty()) GTEST_SKIP() << "no NVFP4 DiT file";
   constexpr std::int64_t kGrid = 64, kCond = 282, kUncond = 10, kRank = 8;

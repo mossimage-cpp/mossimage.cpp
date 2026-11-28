@@ -14,4 +14,9 @@ namespace mi::kernels::lora {
 void scale_columns_bf16(const float* t32, std::int64_t ld32, const float* coef, __nv_bfloat16* t, std::int64_t ldt,
                         std::int64_t m, std::int64_t r, cudaStream_t stream);
 
+// The same scaling without the bf16 rounding, for Turing's fp32 side-branch GEMMs (the factors are tiny, so keeping
+// t in fp32 costs little and makes the delta GEMM use cuBLASLt's fast fp32 kernels).
+void scale_columns_f32(const float* t32, std::int64_t ld32, const float* coef, float* t, std::int64_t ldt,
+                       std::int64_t m, std::int64_t r, cudaStream_t stream);
+
 }  // namespace mi::kernels::lora

@@ -337,7 +337,8 @@ std::size_t VisionEncoder::workspace_bytes(std::int64_t patches) {
                           n / 4 * (kDim * 4 * 2 /*fc1*/ + kOut * 2 /*out*/);
   const std::size_t one_linear = static_cast<std::size_t>(kDim) * 4 * kDim * 4 * 2;  // the largest dequantized weight
   return weights + act + one_linear + kernels::Gemm::kWorkspaceBytes +
-         attention::flash_fwd_workspace_bytes(patches, kernels::vision::kHeads) + (std::size_t{64} << 10) * 64;
+         attention::flash_fwd_workspace_bytes(patches, kernels::vision::kHeads, static_cast<int>(patches)) +
+         (std::size_t{64} << 10) * 64;
 }
 
 Tensor VisionEncoder::encode(const std::vector<Prepared>& images, runtime::DeviceArena& arena, cudaStream_t stream) {
@@ -431,7 +432,8 @@ Tensor VisionEncoder::encode(const std::vector<Prepared>& images, runtime::Devic
     Tensor vp = arena.alloc_tensor(DType::kBF16, {patches, 16, 128});
     Tensor attn = arena.alloc_tensor(DType::kBF16, {patches, 16, 128});
     Tensor mlp = arena.alloc_tensor(DType::kBF16, {patches, kMlp});
-    const std::size_t fa_bytes = attention::flash_fwd_workspace_bytes(patches, kernels::vision::kHeads);
+    const std::size_t fa_bytes =
+        attention::flash_fwd_workspace_bytes(patches, kernels::vision::kHeads, static_cast<int>(patches));
     void* fa_ws = arena.alloc_stack(fa_bytes);
 
     // Patch embedding: Conv3d with stride == kernel is a linear over the flattened (C, T, P, P) patch.

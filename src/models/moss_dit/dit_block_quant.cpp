@@ -10,6 +10,8 @@
 #include "kernels/attention/flash_attention.h"
 #include "kernels/attention_q8/attention_q8.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm75/int8_sm75.h"
+#include "models/lora/side_branch.h"
 #include "kernels/basic/elementwise.h"
 #include "kernels/basic/norm.h"
 #include "kernels/fused/fused_gemm.h"
@@ -72,6 +74,41 @@ Tensor vec(const Tensor& mod, std::int64_t i) {
 
 const __nv_bfloat16* bf(const Tensor& t) { return static_cast<const __nv_bfloat16*>(t.data); }
 __nv_bfloat16* bf_mut(const Tensor& t) { return static_cast<__nv_bfloat16*>(t.data); }
+
+// sm_75 runtime LoRA (no tensor cores): `compute_delta` writes the low-rank Δ into qa.sm75_delta, and the DP4A GEMM
+// adds it in its epilogue. Returns the base view of this row chunk (rows x n, stride cols); the caller applies the
+// site's gated-residual / SiTU epilogue.
+Tensor sm75_lora_base(const QuantBlockBuffers& qa, const QkvGemm& qg, const lora::SiteBranch& s, const Tensor& t,
+                      const kq::Int8Operands& op, bool natural_order, int64_t r0, int64_t rows, cudaStream_t stream) {
+  const std::int64_t n = s.n, cols = qa.sm75_delta.dim(1);
+  Tensor base = Tensor::view(qa.sm75_base.data, DType::kBF16, Device::kCUDA, {rows, n});
+  base.stride[0] = cols;
+  Tensor delta = Tensor::view(qa.sm75_delta.data, DType::kBF16, Device::kCUDA, {rows, n});
+  delta.stride[0] = cols;
+  const Tensor tc = t.slice0(r0, r0 + rows);
+  // Δ does not depend on the base GEMM: compute it first and let the DP4A GEMM add it in its epilogue, removing a
+  // separate elementwise pass without changing the bf16 rounding order.
+  lora::compute_delta(s, tc, delta, natural_order, qa.sm75_scratch, qa.sm75_scratch_bytes, *qg.gemm, qg.workspace,
+                      qg.workspace_bytes, stream);
+  kernels::sm75::int8_gemm_add_delta(op, bf(delta), cols, bf_mut(base), cols, stream);
+  return base;
+}
+
+// Row chunk of a [total, k] bf16 view with a stride.
+Tensor rows_of_view(const Tensor& t, std::int64_t r0, std::int64_t rows, std::int64_t cols) {
+  Tensor v = Tensor::view(static_cast<std::uint16_t*>(t.data) + r0 * t.stride[0], DType::kBF16, Device::kCUDA,
+                          {rows, cols});
+  v.stride[0] = t.stride[0];
+  return v;
+}
+
+kq::Int8Operands int8_chunk(const kq::Int8Operands& op, std::int64_t r0, std::int64_t rows) {
+  kq::Int8Operands c = op;
+  c.x_q += r0 * op.ldx;
+  c.x_scale += r0;
+  c.m = rows;
+  return c;
+}
 
 bool aligned256(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 256 == 0; }
 
@@ -209,9 +246,10 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     throw std::invalid_argument("mi::moss_dit::run_block_quant: a LoRA on the QKV of a block whose q, k and v differ in "
                                 "precision is not supported");
   }
+  const DType lora_t_dtype = kernels::sm75::turing() ? DType::kF32 : DType::kBF16;
   if (qa.lora != nullptr && qa.lora->any_active(block) &&
-      (qa.lora_t.dtype != DType::kBF16 || qa.lora_t.rank != 2 || qa.lora_t.dim(0) < l ||
-       qa.lora_t.dim(1) < qa.lora->max_rank() || qa.lora_workspace_bytes < lora::t_workspace_bytes(l, qa.lora->max_rank()))) {
+      (qa.lora_t.dtype != lora_t_dtype || qa.lora_t.rank != 2 || qa.lora_t.dim(0) < l ||
+       qa.lora_t.dim(1) < qa.lora->max_rank() || qa.lora_workspace_bytes < lora::t_workspace_bytes(l, kF, qa.lora->max_rank()))) {
     throw std::invalid_argument("mi::moss_dit::run_block_quant: LoRA buffers do not match the side branches");
   }
   // INT4 sites that run the INT8 GEMMs on unpacked operands: every INT4 site on a GPU without INT4 MMA
@@ -226,13 +264,17 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     throw std::invalid_argument("mi::moss_dit::run_block_quant: an INT4 linear run through the INT8 GEMMs (LoRA side "
                                 "branch, or int4_via_int8) needs the int4_unpack buffer (kInt4UnpackBytes)");
   }
+  const bool sm75 = kernels::sm75::turing();
   // t of a site for its bf16 input `in` (rows of this run): the LoRA GEMM's operand.
-  const auto prepare = [&](const lora::SiteBranch& sb, const Tensor& in) {
-    Tensor t = Tensor::view(qa.lora_t.data, DType::kBF16, Device::kCUDA, {m, sb.rank});
+  const auto prepare_t = [&](const lora::SiteBranch& sb, const Tensor& in) {
+    Tensor t = Tensor::view(qa.lora_t.data, lora_t_dtype, Device::kCUDA, {m, sb.rank});
     t.stride[0] = qa.lora_t.stride[0];
     lora::compute_t(sb, in, t, qa.lora_workspace, qa.lora_workspace_bytes, *qkv_gemm.gemm, qkv_gemm.workspace,
                     qkv_gemm.workspace_bytes, stream);
-    return lora::lora_slices(sb, t);
+    return t;
+  };
+  const auto prepare = [&](const lora::SiteBranch& sb, const Tensor& in) {
+    return lora::lora_slices(sb, prepare_t(sb, in));
   };
   // An NVFP4 ffn_up_gate writes its whole [m, 2F] output (no SiTU epilogue): the ffn_down quantizer applies SiTU-GLU as
   // it reads it when ffn_down is NVFP4 without a side branch; otherwise the bf16 ffn is materialized after it, in the
@@ -323,7 +365,7 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   // The E1L / E2L term of an NVFP4 site with a side branch, from its bf16 input `in` (rows of this run): t, then
   // Δ = t · Bᵀ stored in bf16 (natural: ffn_up_gate's stored column order).
   const auto nv_delta = [&](const lora::SiteBranch& sb, const Tensor& in, bool natural) {
-    Tensor t = Tensor::view(qa.lora_t.data, DType::kBF16, Device::kCUDA, {m, sb.rank});
+    Tensor t = Tensor::view(qa.lora_t.data, lora_t_dtype, Device::kCUDA, {m, sb.rank});
     t.stride[0] = qa.lora_t.stride[0];
     lora::compute_t(sb, in, t, qa.lora_workspace, qa.lora_workspace_bytes, *qkv_gemm.gemm, qkv_gemm.workspace,
                     qkv_gemm.workspace_bytes, stream);
@@ -362,7 +404,19 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     // The fused norm + rotate + quantize also stores the bf16 norm output (the side branch's input) in y.
     kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)), xq_qkv, kD, scale,
                                           m, static_cast<int>(kD), stream, bf_mut(y), kD);
-    kl::int8_gemm_lora(operands(xq_qkv, kD, scale, w.qkv8, m), nullptr, prepare(*s_qkv, y), bf_mut(qkv), 3 * kD, stream);
+    if (sm75) {
+      const Tensor t = prepare_t(*s_qkv, y);
+      const auto op = operands(xq_qkv, kD, scale, w.qkv8, m);
+      for (std::int64_t r0 = 0; r0 < m; r0 += kSm75LoraChunk) {
+        const std::int64_t rows = std::min(kSm75LoraChunk, m - r0);
+        const Tensor b = sm75_lora_base(qa, qkv_gemm, *s_qkv, t, int8_chunk(op, r0, rows), false, r0, rows, stream);
+        MI_CUDA_CHECK(cudaMemcpy2DAsync(bf_mut(qkv) + r0 * qkv.stride[0], 3 * kD * 2, b.data, b.stride[0] * 2,
+                                        static_cast<std::size_t>(3 * kD) * 2, static_cast<std::size_t>(rows),
+                                        cudaMemcpyDeviceToDevice, stream));
+      }
+    } else {
+      kl::int8_gemm_lora(operands(xq_qkv, kD, scale, w.qkv8, m), nullptr, prepare(*s_qkv, y), bf_mut(qkv), 3 * kD, stream);
+    }
   } else if (!w.qkv8.empty()) {
     kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)), xq_qkv, kD, scale,
                                           m, static_cast<int>(kD), stream);
@@ -473,9 +527,17 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     }
   } else if (!w.o8.empty()) {
     kl::LoraSlices lo;
-    if (s_o != nullptr) lo = prepare(*s_o, attn);  // t from the bf16 input, before it is rotated
+    if (s_o != nullptr && !sm75) lo = prepare(*s_o, attn);  // t from the bf16 input, before it is rotated
     kq::rotate_quantize(bf(attn), kD, xq_y, kD, scale, m, static_cast<int>(kD), stream);
-    if (s_o != nullptr) {
+    if (s_o != nullptr && sm75) {
+      const Tensor t = prepare_t(*s_o, attn);
+      const auto op = operands(xq_y, kD, scale, w.o8, m);
+      for (std::int64_t r0 = 0; r0 < m; r0 += kSm75LoraChunk) {
+        const std::int64_t rows = std::min(kSm75LoraChunk, m - r0);
+        const Tensor b = sm75_lora_base(qa, qkv_gemm, *s_o, t, int8_chunk(op, r0, rows), false, r0, rows, stream);
+        kernels::gated_residual(rows_of_view(x, r0, rows, kD), b, vec(a.mod, 2), rows_of_view(x, r0, rows, kD), stream);
+      }
+    } else if (s_o != nullptr) {
       kl::int8_gemm_gated_residual_lora(operands(xq_y, kD, scale, w.o8, m), nullptr, bf(vec(a.mod, 2)), lo, bf_mut(x), kD,
                                         stream);
     } else {
@@ -537,7 +599,17 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
     kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm2), bf(vec(a.mod, 4)), bf(vec(a.mod, 3)), xq_qkv, kD, scale,
                                           m, static_cast<int>(kD), stream, bf_mut(y), kD);
-    kl::int8_gemm_situ_glu_lora(operands(xq_qkv, kD, scale, w.up_gate8, m), prepare(*s_up, y), bf_mut(ffn), kF, stream);
+    if (sm75) {
+      const Tensor t = prepare_t(*s_up, y);
+      const auto op = operands(xq_qkv, kD, scale, w.up_gate8, m);
+      for (std::int64_t r0 = 0; r0 < m; r0 += kSm75LoraChunk) {
+        const std::int64_t rows = std::min(kSm75LoraChunk, m - r0);
+        const Tensor b = sm75_lora_base(qa, qkv_gemm, *s_up, t, int8_chunk(op, r0, rows), true, r0, rows, stream);
+        kernels::situ_glu(b, rows_of_view(ffn, r0, rows, kF), stream);
+      }
+    } else {
+      kl::int8_gemm_situ_glu_lora(operands(xq_qkv, kD, scale, w.up_gate8, m), prepare(*s_up, y), bf_mut(ffn), kF, stream);
+    }
   } else if (!w.up_gate8.empty()) {
     ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
     kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm2), bf(vec(a.mod, 4)), bf(vec(a.mod, 3)), xq_y, kD, scale,
@@ -592,9 +664,17 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     }
   } else if (!w.down8.empty()) {
     kl::LoraSlices ld;
-    if (s_down != nullptr) ld = prepare(*s_down, ffn);
+    if (s_down != nullptr && !sm75) ld = prepare(*s_down, ffn);
     kq::rotate_quantize(bf(ffn), kF, xq, kF, scale, m, static_cast<int>(kF), stream);
-    if (s_down != nullptr) {
+    if (s_down != nullptr && sm75) {
+      const Tensor t = prepare_t(*s_down, ffn);
+      const auto op = operands(xq, kF, scale, w.down8, m);
+      for (std::int64_t r0 = 0; r0 < m; r0 += kSm75LoraChunk) {
+        const std::int64_t rows = std::min(kSm75LoraChunk, m - r0);
+        const Tensor b = sm75_lora_base(qa, qkv_gemm, *s_down, t, int8_chunk(op, r0, rows), false, r0, rows, stream);
+        kernels::gated_residual(rows_of_view(x, r0, rows, kD), b, vec(a.mod, 5), rows_of_view(x, r0, rows, kD), stream);
+      }
+    } else if (s_down != nullptr) {
       kl::int8_gemm_gated_residual_lora(operands(xq, kF, scale, w.down8, m), nullptr, bf(vec(a.mod, 5)), ld, bf_mut(x), kD,
                                         stream);
     } else {

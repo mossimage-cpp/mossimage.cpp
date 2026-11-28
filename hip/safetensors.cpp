@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 #ifdef _WIN32
 #include <io.h>
@@ -19,6 +20,16 @@ namespace mi::hip::st {
 namespace {
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("safetensors: " + what); }
+
+// ComfyUI checkpoints name the DiT tensors `model.diffusion_model.<name>` (or `diffusion_model.<name>`). The engine
+// looks them up by the official unprefixed names, so strip that prefix on the way into Index, as the CUDA backend's
+// quantizer does. Only Index is used for DiT files; File keeps the names as stored for the other components.
+std::string dit_name(std::string_view name) {
+  for (std::string_view p : {"model.diffusion_model.", "diffusion_model."}) {
+    if (name.starts_with(p)) return std::string(name.substr(p.size()));
+  }
+  return std::string(name);
+}
 
 // The JSON subset safetensors headers and index files use: objects, arrays, strings, numbers, true/false/null.
 struct Json {
@@ -304,6 +315,12 @@ File::File(const std::filesystem::path& file) : path_(utf8(file)) {
 
 File::~File() { close_fd(fd_); }
 
+const std::string* File::metadata(const std::string& key) const {
+  const auto it = metadata_.find(key);
+  return it == metadata_.end() ? nullptr : &it->second;
+}
+
+
 const TensorInfo* File::find(const std::string& name) const {
   const auto it = by_name_.find(name);
   return it == by_name_.end() ? nullptr : &tensors_[it->second];
@@ -318,6 +335,32 @@ const TensorInfo& File::at(const std::string& name) const {
 void File::read(const TensorInfo& t, void* dst, std::uint64_t rel, std::uint64_t bytes) const {
   if (rel > t.bytes || bytes > t.bytes - rel) fail("read past the end of tensor " + t.name);
   read_at(fd_, dst, t.offset + rel, bytes, path_);
+}
+
+std::map<std::string, int> convrot_groups(const std::string& json) {
+  std::map<std::string, int> out;
+  if (json.empty()) return out;
+  const Json root = Parser(json).parse_document();
+  if (root.kind != Json::Kind::kObject) fail("_quantization_metadata is not an object");
+  const Json* layers = root.find("layers");
+  if (layers == nullptr) return out;
+  if (layers->kind != Json::Kind::kObject) fail("_quantization_metadata has no layers object");
+  for (std::size_t m = 0; m < layers->keys.size(); ++m) {
+    const Json& cfg = layers->values[m];
+    if (cfg.kind != Json::Kind::kObject) continue;
+    const Json* fmt = cfg.find("format");
+    const Json* rot = cfg.find("convrot");
+    if (fmt == nullptr || fmt->kind != Json::Kind::kString || fmt->text != "int8_tensorwise" || rot == nullptr ||
+        rot->kind != Json::Kind::kBool || rot->integer == 0)
+      continue;
+    int group = 256;  // comfy-kitchen's default when the config omits the field
+    if (const Json* g = cfg.find("convrot_groupsize")) {
+      if (g->kind != Json::Kind::kNumber || g->integer < 4 || g->integer > 1024) continue;
+      group = static_cast<int>(g->integer);
+    }
+    out.emplace(dit_name(layers->keys[m]), group);
+  }
+  return out;
 }
 
 std::map<std::string, std::string> read_index(const std::filesystem::path& file) {
@@ -364,7 +407,7 @@ Index::Index(const std::filesystem::path& path) {
     files_.push_back(std::make_unique<File>(file));
     const File& f = *files_.back();
     for (const TensorInfo& t : f.tensors()) {
-      if (!tensors_.emplace(t.name, std::make_pair(&f, &t)).second) {
+      if (!tensors_.emplace(dit_name(t.name), std::make_pair(&f, &t)).second) {
         throw std::runtime_error("safetensors: " + t.name + " appears in more than one file under " + utf8(path));
       }
     }
@@ -392,8 +435,15 @@ Index::Index(const std::filesystem::path& path) {
   for (const auto& [name, shard] : weight_map) shards[shard] = true;
   for (const auto& [shard, unused] : shards) add(path / shard);
   for (const auto& [name, shard] : weight_map) {
-    if (!has(name)) throw std::runtime_error("safetensors: " + name + " is in the index but in no shard");
+    if (!has(dit_name(name))) throw std::runtime_error("safetensors: " + name + " is in the index but in no shard");
   }
+}
+
+const std::string* Index::metadata(const std::string& key) const {
+  for (const auto& f : files_) {
+    if (const std::string* v = f->metadata(key)) return v;
+  }
+  return nullptr;
 }
 
 const TensorInfo& Index::at(const std::string& name) const {

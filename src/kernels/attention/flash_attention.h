@@ -30,6 +30,9 @@ namespace mi::attention {
 // Scratch bytes flash_fwd needs: the per-row softmax log-sum-exp the kernels always write, fp32
 // [num_heads, total_q].
 std::size_t flash_fwd_workspace_bytes(std::int64_t total_q, int num_heads);
+// With an upper bound on one sequence's length. Identical to the two-argument form except on Turing cards without
+// tensor cores, whose exact attention keeps its score matrix in this workspace.
+std::size_t flash_fwd_workspace_bytes(std::int64_t total_q, int num_heads, int max_seqlen);
 
 // out = softmax(q·kᵀ·scale [+ causal mask])·v per sequence and head. Heads come from the tensor shapes
 // (num_heads = q.dim(1), num_kv_heads = k.dim(1)).

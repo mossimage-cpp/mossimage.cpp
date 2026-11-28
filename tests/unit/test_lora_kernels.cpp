@@ -21,6 +21,7 @@
 #include "kernels/lora/lora_gemm.h"
 #include "kernels/lora/lora_kernels.h"
 #include "kernels/quant/quant.h"
+#include "kernels/sm75/sm75.h"
 #include "models/lora/lora.h"
 #include "models/lora/lora_merge_device.h"
 #include "models/lora/side_branch.h"
@@ -43,6 +44,10 @@ bool has_gpu() {
   int n = 0;
   return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
 }
+
+// These kernels are the sm_80+ CUTLASS LoRA GEMMs; sm_7x runs runtime LoRAs as the fp32 side branch instead.
+#define REQUIRE_NO_SM7X()                                                              \
+  if (mi::kernels::sm75::turing()) GTEST_SKIP() << "fused LoRA GEMMs need sm_80+"
 
 #define REQUIRE_GPU() \
   if (!has_gpu()) GTEST_SKIP() << "no CUDA device"
@@ -171,6 +176,7 @@ struct LoraData {
 
 TEST(LoraFusedGemm, Bf16ZeroTIsBitIdenticalAndMathExact) {
   REQUIRE_GPU();
+  REQUIRE_NO_SM7X();
   using namespace fused_test;
   const std::vector<SliceDef> defs(std::begin(kSlices), std::end(kSlices)), situ_defs{kSituSlice};
   // Zero t: the plain variants' bits.
@@ -245,6 +251,7 @@ TEST(LoraFusedGemm, Bf16ZeroTIsBitIdenticalAndMathExact) {
 
 TEST(LoraFusedGemm, Int8ZeroTIsBitIdenticalAndMathExact) {
   REQUIRE_GPU();
+  REQUIRE_NO_SM7X();
   using namespace fused_test;
   const std::vector<SliceDef> defs(std::begin(kSlices), std::end(kSlices)), situ_defs{kSituSlice};
   std::mt19937 rng(5);
@@ -371,6 +378,7 @@ float scale_ulp(const std::vector<float>& v) {
 // own ranges), a k-only qkv site, the permuted ffn_up_gate, ffn_down; then strengths and generations.
 TEST(LoraSideBranch, LayoutTermsStrengthsGenerations) {
   REQUIRE_GPU();
+  REQUIRE_NO_SM7X();
   using namespace side_test;
   mi::testing::TempDir dir("lora_side");
   std::vector<StTensor> f1 = lr("diffusion_model.layers.0.proj.qkv", ".lora_down.weight", ".lora_up.weight", 3 * kD, kD, 4, 1);
@@ -415,7 +423,7 @@ TEST(LoraSideBranch, LayoutTermsStrengthsGenerations) {
     const char* what = site_name(c.site);
     const U16 x = rand_bf16(static_cast<std::size_t>(m * s.k), 100 + c.block, 1.0f);
     Dev dx(x, mi::DType::kBF16, {m, s.k}), dt(U16{}, mi::DType::kBF16, {m, s.rank});
-    DeviceBuffer ws(t_workspace_bytes(m, s.rank));
+    DeviceBuffer ws(t_workspace_bytes(m, s.k, s.rank));
     compute_t(s, dx.t, dt.t, ws.get(), ws.size(), gemm, gws.get(), gws.size(), nullptr);
     // gemm_lora on a zero weight: out = bf16(0 + t · bᵀ).
     Dev zw(U16(static_cast<std::size_t>(s.n * s.k), 0), mi::DType::kBF16, {s.n, s.k}), out(U16{}, mi::DType::kBF16, {m, s.n});
@@ -518,6 +526,7 @@ TEST(LoraSideBranch, LayoutTermsStrengthsGenerations) {
 // adapter written as three separate q / k / v adapters with that A triples the rank. Both give the same output.
 TEST(LoraSideBranch, SharedFusedQkvEqualsSeparateAdapters) {
   REQUIRE_GPU();
+  REQUIRE_NO_SM7X();
   using namespace side_test;
   mi::testing::TempDir dir("lora_shared");
   const std::int64_t r = 16;
@@ -549,7 +558,7 @@ TEST(LoraSideBranch, SharedFusedQkvEqualsSeparateAdapters) {
   Dev dx(x, mi::DType::kBF16, {m, kD}), dw(w, mi::DType::kBF16, {3 * kD, kD});
   const auto run = [&](const SiteBranch& s) {
     Dev dt(U16{}, mi::DType::kBF16, {m, s.rank}), out(U16{}, mi::DType::kBF16, {m, 3 * kD});
-    DeviceBuffer ws(t_workspace_bytes(m, s.rank));
+    DeviceBuffer ws(t_workspace_bytes(m, s.k, s.rank));
     compute_t(s, dx.t, dt.t, ws.get(), ws.size(), gemm, gws.get(), gws.size(), nullptr);
     kernels::lora::gemm_lora(out.t, dx.t, dw.t, lora_slices(s, dt.t), nullptr);
     MI_CUDA_CHECK(cudaDeviceSynchronize());

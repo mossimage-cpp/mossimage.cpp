@@ -36,6 +36,11 @@ bool fp16_weights();
 // translation units branch on this.
 inline bool turing() { return fp16_weights(); }
 
+// True on Turing cards whose SMs have no tensor cores (GTX 16xx / TU116 / TU117). They still decode mma.sync for
+// binary compatibility, but on the ordinary arithmetic units. These paths use native DP4A or fp32 GEMMs instead.
+// Cached per device.
+bool no_tensor_cores();
+
 // Converts a bf16 GEMM weight to fp16 in place and marks the view kF16. No-op when fp16_weights() is false or the
 // tensor is already fp16; throws std::logic_error for any other dtype. For resident weights (converted once).
 void convert_weight_inplace(Tensor& w, cudaStream_t stream);
@@ -75,6 +80,7 @@ void vae_conv2d_down(const Tensor& x, const Tensor& w, const Tensor& bias, const
 
 void vae_attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& o, float scale,
                         cudaStream_t stream);
+
 // torch conv weight [K,C,R,S] fp32 -> [K,R,S,C] in dst's dtype (kF32 or kBF16).
 void vae_weight_to_krsc(const Tensor& w_kcrs, const Tensor& w_krsc, cudaStream_t stream);
 
@@ -86,9 +92,18 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
                const Tensor& cu_seqlens_k, int max_seqlen, bool causal, float scale, void* workspace,
                std::size_t workspace_bytes, cudaStream_t stream);
 
+// On Turing cards without tensor cores the emulated fp16 MMA is slow; this alternative runs the two matmuls as fp32
+// cuBLASLt GEMMs and the softmax on CUDA cores. It needs a larger workspace than flash_fwd (the score matrix), sized
+// by flash_fwd_workspace_bytes_sm75, and produces the same numerics within the engine's attention tolerances.
+std::size_t flash_fwd_workspace_bytes_sm75(std::int64_t total_q, int num_heads, int head_dim,
+                                           std::int64_t max_seqlen);
+void flash_fwd_f32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out, const Tensor& cu_seqlens_q,
+                   const Tensor& cu_seqlens_k, int max_seqlen, bool causal, float scale, void* workspace,
+                   std::size_t workspace_bytes, cudaStream_t stream);
+
 // 8-bit attention (`q8_fp16`/`q8_fp16_f32acc`), the sm_75 counterpart of attention_q8::attention_q8's fp16 variants:
 // head_dim 128, non-causal, varlen/GQA; q and k are quantized per row (int8) and v becomes fp16 (attention_q8_sm75.cu,
-// Turing's m8n8k16 INT8 MMA for QK^T, the exact kernel's fp16 P·V). Lossy by design, like the sm_80 variants.
+// native DP4A for QK^T, the exact kernel's fp16 P·V). Lossy by design, like the sm_80 variants.
 std::size_t q8_workspace_bytes(std::int64_t total_q, std::int64_t total_k, int num_heads, int num_kv_heads);
 void q8_flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out, const Tensor& cu_seqlens_q,
                   const Tensor& cu_seqlens_k, int max_seqlen, float scale, void* workspace, std::size_t workspace_bytes,

@@ -29,10 +29,10 @@ std::size_t DeviceArena::free_device_bytes() {
   return free_b;
 }
 
-DeviceArena::DeviceArena(std::size_t bytes) {
+DeviceArena::DeviceArena(std::size_t bytes, bool oversubscribe) {
   const std::size_t cap = bytes / kArenaAlign * kArenaAlign;
   const std::size_t free_b = free_device_bytes();
-  if (cap > free_b) throw BudgetError(cap, free_b);
+  if (!oversubscribe && cap > free_b) throw BudgetError(cap, free_b);
   if (cap > 0) {
     // free_b is a snapshot; another process can win the race. Report that as a budget problem too.
     const cudaError_t err = cudaMalloc(&base_, cap);

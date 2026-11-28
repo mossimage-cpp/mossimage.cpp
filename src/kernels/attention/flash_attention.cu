@@ -68,6 +68,17 @@ void require_sm80(int device) {
 
 }  // namespace
 
+std::size_t flash_fwd_workspace_bytes(std::int64_t total_q, int num_heads, int max_seqlen) {
+#if MOSSINFER_HAVE_SM75
+  if (kernels::sm75::turing() && kernels::sm75::no_tensor_cores()) {
+    return kernels::sm75::flash_fwd_workspace_bytes_sm75(total_q, num_heads, 256, max_seqlen);
+  }
+#else
+  static_cast<void>(max_seqlen);
+#endif
+  return flash_fwd_workspace_bytes(total_q, num_heads);
+}
+
 std::size_t flash_fwd_workspace_bytes(std::int64_t total_q, int num_heads) {
   return static_cast<std::size_t>(total_q) * static_cast<std::size_t>(num_heads) * sizeof(float);
 }
@@ -162,10 +173,15 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
 #endif
 #if MOSSINFER_HAVE_SM75
   if (kernels::sm75::turing()) {
-    // Turing: the sm_75 family's own exact attention (src/kernels/sm75/attention_sm75.cu, fp16 MMA; the vendored
-    // kernel's sm_75 traits are not used); q/k/v/out are converted around the launch there.
-    kernels::sm75::flash_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, causal, scale, workspace,
-                             workspace_bytes, stream);
+    // Turing: the sm_75 family's own exact attention. Cards with tensor cores use the fp16 MMA kernel; cards without
+    // them use the fp32-cuBLASLt path, since their SM executes mma.sync on ordinary arithmetic units.
+    if (kernels::sm75::no_tensor_cores()) {
+      kernels::sm75::flash_fwd_f32(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, causal, scale, workspace,
+                                   workspace_bytes, stream);
+    } else {
+      kernels::sm75::flash_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, causal, scale, workspace,
+                               workspace_bytes, stream);
+    }
     return;
   }
 #endif

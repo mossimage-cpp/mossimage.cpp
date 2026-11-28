@@ -47,6 +47,7 @@
 #include "kernels/attention/flash_attention.h"
 #include "kernels/basic/gemm.h"
 #include "kernels/basic/rope.h"
+#include "kernels/sm75/sm75.h"
 #include "models/lora/lora.h"
 #include "models/lora/side_branch.h"
 #include "models/moss_dit/dit_block_fused.h"
@@ -81,6 +82,10 @@ constexpr std::int64_t kGridH = 6, kGridW = 8;
 constexpr std::int64_t kText[] = {17, 9};
 constexpr md::AttentionMode kQ8Modes[] = {md::AttentionMode::kQ8Fp8, md::AttentionMode::kQ8Fp16, md::AttentionMode::kQ8Fp8F32Acc,
                                           md::AttentionMode::kQ8Fp16F32Acc};
+
+// The LoRA block tests build bf16 t and call the sm_80+ fused LoRA GEMMs; sm_7x uses the fp32 side branch instead.
+#define REQUIRE_NO_SM7X()                                                              \
+  if (mi::kernels::sm75::turing()) GTEST_SKIP() << "LoRA side-branch tests need sm_80+"
 
 fs::path env_path(const char* var, const char* fallback) {
   const char* env = std::getenv(var);
@@ -438,7 +443,7 @@ class DitInt4Block : public ::testing::Test {
       qa.attn_workspace_bytes = q8_bytes;
       if (lora != nullptr) {
         lora_t = std::make_unique<DevTensor>(DType::kBF16, std::initializer_list<std::int64_t>{l, lora->max_rank()});
-        lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, lora->max_rank()));
+        lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, md::kFfnDim, lora->max_rank()));
         qa.lora = lora;
         qa.lora_t = lora_t->t;
         qa.lora_workspace = lora_ws.get();
@@ -679,6 +684,7 @@ fs::path write_zero_lora() {
 
 // Runtime LoRA on INT4 sites (the INT8 LoRA GEMMs on the operands unpacked to INT8).
 TEST_F(DitInt4Block, LoraOnInt4Sites) {
+  REQUIRE_NO_SM7X();
   {
     const auto hx = hash_x();
     const auto plain = run_block(w4_, hx, kText);

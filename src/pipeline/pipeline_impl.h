@@ -222,10 +222,6 @@ inline void check_user_paths(const PipelineOptions& o, const Request& r) {
 // On a Volta or Turing device: throws NotSupportedError for what still needs sm_80+ kernels (pipeline.cpp). No-op elsewhere.
 void refuse_unsupported_on_sm7x(const Request& req);
 
-// On a Volta or Turing device, runtime LoRAs are merged into the weights at load: the side branches are fused into
-// sm_80+ CUTLASS GEMMs. Sets req.lora_placement to kMerge there (Pipeline::run and every Session run); no-op elsewhere.
-void force_lora_merge_on_sm7x(Request& req);
-
 inline moss_dit::SkipSet skip_set(const std::vector<int>& layers) {
   moss_dit::SkipSet s;
   for (const int l : layers) s.set(static_cast<std::size_t>(l));
@@ -916,7 +912,9 @@ struct Pipeline::Impl {
       sample_memory();
       arena.reset();
     }
-    arena = std::make_unique<runtime::DeviceArena>(capacity);
+    // In soft-VRAM mode the planner may hand down an arena larger than the dedicated memory currently free: let
+    // cudaMalloc decide whether WDDM can serve it from shared GPU memory instead of refusing it here.
+    arena = std::make_unique<runtime::DeviceArena>(capacity, planner::soft_vram_budget());
     ++mem->arena_creations;
     mem->arena_capacity = std::max(mem->arena_capacity, arena->capacity());
   }

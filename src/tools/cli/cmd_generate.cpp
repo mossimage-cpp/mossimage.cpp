@@ -17,6 +17,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "api/progress_model.h"
 #include "models/moss_dit/distill.h"
@@ -50,7 +55,7 @@ constexpr const char* kUsage =
     "                           [--dit-blocks op_by_op|fused|fused_graphs] [--dit <file>] [--te <file>] [--vae <file>]\n"
     "                           --tier reference|high|turbo [--attention auto|exact|q8|q8_fp8|q8_fp16|...]\n"
     "                           [--preview <preview.png> [--preview-every N]] [--lora <file> [--lora-scale S]]...\n"
-    "                           [--lora-strict] [--distill <dir>] [--time-embedding <file>] [--quiet]\n"
+    "                           [--lora-strict] [--distill <dir>] [--time-embedding <file>] [--quiet] [--verbose]\n"
     "                           [--init-image <png|jpg> [--strength X] [--mask <png|jpg>] [--resize crop|fit|stretch]]\n"
     "                           [--hires <W>x<H>|<scale> [--hires-strength X] [--hires-steps N]]\n"
     "                           [--cfg-truncation X] [--step-cache off|fbcache] [--step-cache-threshold X]\n"
@@ -222,8 +227,17 @@ void parse_hires(const std::string& v, pipeline::Request& req) {
   req.hires.height = std::max(16, static_cast<int>(std::lround(req.height * scale / 16)) * 16);
 }
 
-void print_summary(const pipeline::Result& r) {
+void print_summary(const pipeline::Result& r, bool verbose) {
   const auto& t = r.timings;
+  if (!verbose) {
+    std::fprintf(stderr,
+                 "seed %llu, %dx%d, %s tier, %s attention: %d steps, total %.2f s (load %.2f, encode %.2f, denoise %.2f, decode %.2f), peak %.2f GiB\n",
+                 static_cast<unsigned long long>(r.seed), r.width, r.height, planner::tier_name(r.tier.tier),
+                 planner::attention_name(r.tier.attention), r.steps_run, t.total_s,
+                 t.index_load_s + t.dit_load_s + t.vae_load_s, t.tokenize_s + t.text_encode_s + t.refine_s,
+                 t.denoise_s, t.decode_s, static_cast<double>(r.memory.device_peak) / (1 << 30));
+    return;
+  }
   std::fprintf(stderr,
                "seed %llu, %d steps, %d+%d tokens%s: total %.2f s (load %.2f, encode %.2f, denoise %.2f, decode %.2f%s); "
                "device peak %.2f GiB (arena high-water %.2f GiB), host private peak %.2f GiB%s; DiT blocks %s\n",
@@ -336,7 +350,7 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
   fs::path params, out_png, out_latent, report, preview_png;
   int preview_every = 1;
   std::vector<std::string> then_prompts;
-  bool have_prompt = false, quiet = false, size_given = false;
+  bool have_prompt = false, quiet = false, verbose = false, size_given = false;
   fs::path init_image, mask;
   std::vector<fs::path> control_images;  // per --control-image, in order
   std::vector<fs::path> reference_images;  // per --reference, in order
@@ -350,7 +364,7 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
   std::vector<std::pair<std::string, std::string>> flags;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string& a = args[i];
-    if (a == "--direct-io" || a == "--buffered-io" || a == "--quiet" || a == "--no-metadata" || a == "--lora-strict") {
+    if (a == "--direct-io" || a == "--buffered-io" || a == "--quiet" || a == "--verbose" || a == "--no-metadata" || a == "--lora-strict") {
       flags.emplace_back(a, "");
       continue;
     }
@@ -486,6 +500,7 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
       else if (f == "--step-cache") req.accel.step_cache = pipeline::accel::parse_step_cache(v);
       else if (f == "--step-cache-threshold") req.accel.step_cache_threshold = to_double(f, v);
       else if (f == "--quiet") quiet = true;
+      else if (f == "--verbose") verbose = true;
       else if (f == "--reference") reference_images.push_back(path_arg(v, f));
       else if (f == "--reference-max-edge") req.references.max_edge = to_int32(f, v);
       else if (f == "--lora-placement") req.lora_placement = lora::parse_placement(v);
@@ -598,7 +613,7 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
   api::HeldModels held;
   api::JobShape shape;
   control.on_plan = [&](const planner::ExecutionPlan& plan) {
-    if (quiet) return;
+    if (quiet || !verbose) return;
     if (!rates.measured) rates = api::stored_rates(options.cache_dir);  // the first generate's probe, once stored
     const api::Estimate e = api::estimate_of(api::generate_segments(plan, rates, held, model_bytes, shape), plan, rates);
     std::fprintf(stderr, "%s\n%s\n", plan.explanation.c_str(), api::estimate_text(e).c_str());
@@ -625,16 +640,17 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
       const std::vector<pipeline::PngText> text =
           q.save_metadata ? pipeline::generation_text_chunks(pipeline::generation_metadata(q, r)) : std::vector<pipeline::PngText>{};
       pipeline::write_png_rgb8(png, r.rgb, r.width, r.height, text);
+      if (!quiet) std::fprintf(stderr, "wrote %s\n", util::path_utf8(png).c_str());
     }
     for (const std::string& w : r.lora_warnings) std::fprintf(stderr, "warning: LoRA %s\n", w.c_str());
     for (const std::string& w : r.reference_warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
-    if (r.references.count > 0 && !quiet) {
+    if (r.references.count > 0 && verbose && !quiet) {
       std::fprintf(stderr, "references: %d image(s), %lld tokens, cache %.0f MiB; encode %.2f s, prefill %.2f s (%d pass%s)\n",
                    r.references.count, static_cast<long long>(r.references.tokens),
                    static_cast<double>(r.references.cache_bytes) / (1 << 20), r.timings.reference_encode_s,
                    r.timings.reference_prefill_s, r.references.prefills, r.references.prefills == 1 ? "" : "es");
     }
-    if (!r.control.adapter.empty() && !quiet) {
+    if (!r.control.adapter.empty() && verbose && !quiet) {
       std::fprintf(stderr, "control: %s (%d LoRA adapters: %d side branch, %d merged), %d image(s) encoded\n",
                    r.control.lora.file.c_str(), r.control.lora.adapters, r.control.lora.side_branch, r.control.lora.merged,
                    r.control.encodes);
@@ -652,7 +668,7 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
                      t->dropped_tokens(), t->max_length);
       }
     }
-    if (!quiet) print_summary(r);
+    if (!quiet) print_summary(r, verbose);
     return r;
   };
   const pipeline::Result r = run(req, out_png);
@@ -681,7 +697,11 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
     std::cerr << "moss-infer generate: cancelled during a follow-up image\n";
     return 130;
   }
-  return 0;
+  // The image, latents and report are written by now. On WDDM, freeing the device arena during Pipeline destruction
+  // can fault after a run that spilled into shared GPU memory, so exit without running those destructors.
+  std::cout.flush();
+  std::cerr.flush();
+  _exit(0);
 }
 
 }  // namespace

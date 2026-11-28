@@ -177,8 +177,9 @@ int run_attention(const char* name, int heads, int kv_heads, int dim, bool causa
   dcu.upload(cu);
   dcu_k.upload(cu_k);
   MI_CUDA_CHECK(cudaMemset(dout.get(), 0, qb.size() * 2));
+  const std::size_t ws_bytes = mi::attention::flash_fwd_workspace_bytes(total_q, heads, max_len);
   std::vector<float> lse(static_cast<std::size_t>(total_q) * heads, 0.f);
-  DevBuf dls(lse.size() * sizeof(float));
+  DevBuf dls(ws_bytes);
   MI_CUDA_CHECK(cudaMemset(dls.get(), 0, lse.size() * sizeof(float)));
 
   auto t = [](void* p, DType dt, std::initializer_list<std::int64_t> shape) {
@@ -190,7 +191,6 @@ int run_attention(const char* name, int heads, int kv_heads, int dim, bool causa
   const Tensor to = t(dout.get(), DType::kBF16, {total_q, heads, dim});
   const Tensor tcu = t(dcu.get(), DType::kI32, {batch + 1});
   const Tensor tcu_k = t(dcu_k.get(), DType::kI32, {batch + 1});
-  const std::size_t ws_bytes = mi::attention::flash_fwd_workspace_bytes(total_q, heads);
   MI_CUDA_CHECK(cudaGetLastError());
   std::printf("  launch: tokens %d heads %d kv %d dim %d causal %d maxlen %d ws %zu\n", total_q, heads, kv_heads, dim,
               causal ? 1 : 0, max_len, ws_bytes);
@@ -580,6 +580,9 @@ int main(int argc, char** argv) {
   options.query_free_memory = false;
   const mi::backend::ProbeResult probe = mi::backend::probe(options);
   std::printf("%s", mi::backend::format_report(probe).c_str());
+  if (mi::kernels::sm75::turing()) {
+    std::printf("sm_75 tensor cores: %s\n", mi::kernels::sm75::no_tensor_cores() ? "no" : "yes");
+  }
   int failures = 0;
   try {
     if (what == "convert" || what == "all") failures += run_convert();

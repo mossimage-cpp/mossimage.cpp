@@ -534,7 +534,7 @@ struct TextEncoder::Impl {
       kernels::qwen_rope_apply(k3.slice0(s, e), table, k3.slice0(s, e), stream);
     });
     Tensor attn = arena.alloc_tensor(DType::kBF16, {t, kNumHeads, kAttnHeadDim});
-    const std::size_t ws_bytes = attention::flash_fwd_workspace_bytes(t, kNumHeads);
+    const std::size_t ws_bytes = attention::flash_fwd_workspace_bytes(t, kNumHeads, static_cast<int>(t));
     void* ws = arena.alloc_stack(ws_bytes);
     attention::flash_fwd(q, k3, v3, attn, b.cu_dev, b.cu_dev, b.max_len, /*causal=*/true, kAttnScale, ws, ws_bytes,
                          stream);
@@ -1038,7 +1038,7 @@ std::size_t workspace_bytes_impl(const weights::ModelIndex& index, const QuantTe
                             3 * rows(kHidden, 2) +  // x, h, y
                             quant_scratch_bytes(qm, t);
   const std::size_t attn = rows(kQgDim, 2) + 2 * rows(kKvDim, 2) + 2 * rows(kNumHeads * kAttnHeadDim, 2) +
-                           align_up(attention::flash_fwd_workspace_bytes(t, kNumHeads));
+                           align_up(attention::flash_fwd_workspace_bytes(t, kNumHeads, static_cast<int>(t)));
   const std::size_t delta_net = 2 * rows(gdn::kConvDim, 2) + rows(gdn::kValueDim, 2) + 3 * rows(gdn::kNumVHeads, 2) +
                           rows(gdn::kNumVHeads, 4) + rows(gdn::kNumVHeads * gdn::kHeadDim, 2) +
                           align_up(gdn::chunk_gated_delta_rule_workspace_bytes(t));

@@ -37,8 +37,10 @@ struct ArenaOverflow : std::runtime_error {
 class DeviceArena {
  public:
   // Reserves `bytes` (rounded down to kArenaAlign). Throws BudgetError if cudaMemGetInfo reports
-  // fewer free bytes than that, before touching the allocator.
-  explicit DeviceArena(std::size_t bytes);
+  // fewer free bytes than that, before touching the allocator. With `oversubscribe` that up-front
+  // check is skipped and the allocator decides: on WDDM it can serve the request from shared GPU
+  // memory; a genuine cudaMalloc failure still surfaces as BudgetError.
+  explicit DeviceArena(std::size_t bytes, bool oversubscribe = false);
   ~DeviceArena();
   DeviceArena(DeviceArena&& o) noexcept;
   DeviceArena& operator=(DeviceArena&& o) noexcept;

@@ -114,7 +114,8 @@ struct Gemm::Impl {
                                                  sizeof(bias_ptr)));
     }
     const auto u64 = [](std::int64_t v) { return static_cast<std::uint64_t>(v); };
-    const cudaDataType_t ab_type = key.ab_type ? CUDA_R_16F : CUDA_R_16BF;
+    const cudaDataType_t ab_type =
+        key.ab_type == 2 ? CUDA_R_32F : (key.ab_type == 1 ? CUDA_R_16F : CUDA_R_16BF);
     MI_LT_CHECK(cublasLtMatrixLayoutCreate(&plan->a, ab_type, u64(key.k), u64(key.n), key.ldw));
     MI_LT_CHECK(cublasLtMatrixLayoutCreate(&plan->b, ab_type, u64(key.k), u64(key.m), key.ldx));
     MI_LT_CHECK(cublasLtMatrixLayoutCreate(&plan->d, cuda_type(static_cast<DType>(key.out_type)), u64(key.n),
@@ -151,6 +152,21 @@ struct Gemm::Impl {
     plan->algo = result.algo;
     plan->workspace = result.workspaceSize;
     return *plans.emplace(key, std::move(plan)).first->second;
+  }
+
+  // Direct cuBLASLt launch, shared by linear() and linear_f32().
+  void run_direct(const Key& key, const void* x, const void* w, const Tensor& out, const Tensor* bias, void* workspace,
+                  std::size_t workspace_bytes, cudaStream_t stream) {
+    const void* bias_ptr = bias != nullptr ? bias->data : nullptr;
+    std::lock_guard<std::mutex> lock(mutex);
+    Plan& plan = plan_for(key, bias_ptr);
+    if (bias_ptr != nullptr) {
+      MI_LT_CHECK(cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr,
+                                                 sizeof(bias_ptr)));
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    MI_LT_CHECK(cublasLtMatmul(handle, plan.desc, &alpha, w, plan.a, x, plan.b, &beta, out.data, plan.d, out.data,
+                               plan.d, &plan.algo, workspace, plan.workspace, stream));
   }
 
   // sm_75 path: x is bf16, the GEMM runs fp16 in / fp32 out on Turing's tensor cores, and a second pass converts the
@@ -318,15 +334,28 @@ void Gemm::linear(const Tensor& out, const Tensor& x, const Tensor& w, const Ten
     return;
   }
 
-  const void* bias_ptr = bias != nullptr ? bias->data : nullptr;
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  Plan& plan = impl_->plan_for(key, bias_ptr);
-  if (bias_ptr != nullptr) {
-    MI_LT_CHECK(cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr)));
+  impl_->run_direct(key, x.data, w.data, out, bias, workspace, workspace_bytes, stream);
+}
+
+void Gemm::linear_f32(const Tensor& out, const Tensor& x, const Tensor& w, void* workspace,
+                      std::size_t workspace_bytes, cudaStream_t stream) {
+  constexpr const char* op = "linear_f32";
+  detail::check_rows(op, "x", x, DType::kF32);
+  detail::check_rows(op, "w", w, DType::kF32, x.dim(-1));
+  if (w.rank != 2) detail::fail(op, "w must be [N, K], got " + w.describe());
+  if (out.dtype != DType::kBF16 && out.dtype != DType::kF32) detail::fail(op, "out must be bf16 or f32");
+  detail::check_rows(op, "out", out, out.dtype, w.dim(0));
+  const std::int64_t m = detail::rows_of(x), n = w.dim(0), k = x.dim(-1);
+  if (detail::rows_of(out) != m) detail::fail(op, "row count mismatch");
+  const std::int64_t ldx = row_stride(x), ldw = row_stride(w), ldo = row_stride(out);
+  if (ldx < k || ldw < k || ldo < n) detail::fail(op, "x, w and out must each be rows with one stride");
+  if (workspace_bytes > 0 && (workspace == nullptr || alignment(workspace) < 256)) {
+    detail::fail(op, "workspace must be 256-byte aligned");
   }
-  const float alpha = 1.0f, beta = 0.0f;
-  MI_LT_CHECK(cublasLtMatmul(impl_->handle, plan.desc, &alpha, w.data, plan.a, x.data, plan.b, &beta, out.data, plan.d,
-                             out.data, plan.d, &plan.algo, workspace, plan.workspace, stream));
+  if (m == 0 || n == 0) return;
+  const Key key{m, n, k, ldx, ldw, ldo, static_cast<int>(out.dtype), -1, 2, workspace_bytes,
+                alignment(x.data), alignment(w.data), alignment(out.data), 0u};
+  impl_->run_direct(key, x.data, w.data, out, nullptr, workspace, workspace_bytes, stream);
 }
 
 }  // namespace mi::kernels

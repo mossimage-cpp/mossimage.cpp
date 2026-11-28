@@ -9,6 +9,7 @@
 
 #include "dit_kernels.h"
 #include "safetensors.h"
+#include "weights/quant/quant_codec.h"
 
 namespace mi::hip {
 namespace {
@@ -93,6 +94,12 @@ std::uint64_t buffer_bytes(const std::vector<std::vector<std::int64_t>>& shapes)
   return total;
 }
 
+std::size_t numel(const std::vector<std::int64_t>& shape) {
+  std::size_t n = 1;
+  for (std::int64_t d : shape) n *= static_cast<std::size_t>(d);
+  return n;
+}
+
 }  // namespace
 
 std::uint64_t Dit::block_bytes() { return kBlock.bytes; }
@@ -120,21 +127,54 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     if (t.shape != shape) fail(name + " has an unexpected shape");
     return t.bytes;
   };
+  // StarNodes-style INT8 ConvRot files quantize every linear, including the globals and the text refiner, which this
+  // backend runs as bf16. Their `_quantization_metadata` says which modules to undo; the DiT blocks stay INT8.
+  const std::string* qmd = index.metadata("_quantization_metadata");
+  const auto convrot = st::convrot_groups(qmd != nullptr ? *qmd : "");
+  const auto read_bf16 = [&](const std::string& name, const std::vector<std::int64_t>& shape) {
+    const st::TensorInfo& t = index.at(name);
+    if (t.shape != shape) fail(name + " has an unexpected shape");
+    std::vector<bf16> out(numel(shape));
+    if (t.dtype == "BF16") {
+      index.read_into(name, out.data(), out.size() * kBf16);
+      return out;
+    }
+    if (t.dtype != "I8" || shape.size() != 2 || !name.ends_with(".weight"))
+      fail(name + " is " + t.dtype + ", expected BF16");
+    const std::string module = name.substr(0, name.size() - 7);
+    const auto it = convrot.find(module);
+    if (it == convrot.end() || !quant::valid_convrot_group(it->second) || shape[1] % it->second != 0)
+      fail(name + " is INT8 but has no int8_convrot config in _quantization_metadata");
+    const std::string sname = name + "_scale";
+    const st::TensorInfo& scale = index.at(sname);
+    // Comfy-kitchen writes [N, 1]; the converter's own files use [N]. Both are one scale per output row.
+    const bool scales_ok = scale.dtype == "F32" && (scale.shape == std::vector<std::int64_t>{shape[0]} ||
+                                                    scale.shape == std::vector<std::int64_t>({shape[0], 1}));
+    if (!scales_ok) fail(sname + " is not F32 [N] or [N, 1] as INT8 ConvRot requires");
+    const std::size_t rows = static_cast<std::size_t>(shape[0]), cols = static_cast<std::size_t>(shape[1]);
+    std::vector<std::int8_t> q(rows * cols);
+    std::vector<float> s(rows), deq(rows * cols);
+    index.read_into(name, q.data(), q.size());
+    index.read_into(sname, s.data(), s.size() * sizeof(float));
+    quant::dequantize_rows(q.data(), s.data(), static_cast<std::int64_t>(rows), static_cast<std::int64_t>(cols), it->second,
+                           deq.data());
+    for (std::size_t i = 0; i < deq.size(); ++i) out[i] = quant::float_to_bf16(deq[i]);
+    return out;
+  };
   // Tensors into one new device buffer, each at a 256-byte aligned offset; returns their device pointers.
-  std::vector<std::uint8_t> host;
+  std::vector<bf16> host;
   const auto load = [&](const std::vector<std::string>& names, const std::vector<std::vector<std::int64_t>>& shapes) {
     std::vector<std::size_t> offsets;
     std::size_t total = 0;
     for (std::size_t i = 0; i < names.size(); ++i) {
       offsets.push_back(total);
-      total += aligned(check_tensor(names[i], shapes[i]));
+      total += aligned(numel(shapes[i]) * kBf16);
     }
     owned_.emplace_back(total);
     DeviceBuffer& buf = owned_.back();
     for (std::size_t i = 0; i < names.size(); ++i) {
-      host.resize(index.at(names[i]).bytes);
-      index.read_into(names[i], host.data(), host.size());
-      buf.upload(host.data(), host.size(), offsets[i]);
+      host = read_bf16(names[i], shapes[i]);
+      buf.upload(host.data(), host.size() * kBf16, offsets[i]);
     }
     weight_bytes_ += total;
     std::vector<const bf16*> out;

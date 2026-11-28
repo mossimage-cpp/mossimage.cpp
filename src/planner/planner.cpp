@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -144,7 +145,23 @@ class Planner {
     for (const Candidate& c : all) {
       if (c.device() <= cap_ && c.host_without_cache + kCacheFloor <= host_limit_ && pin_room(c)) feasible.push_back(&c);
     }
-    if (feasible.empty()) throw_budget_error(all);
+    if (feasible.empty()) {
+      if (!soft_vram_budget()) throw_budget_error(all);
+      // Diagnostic only: keep the leanest configuration and let CUDA fall back to shared GPU memory.
+      const Candidate* lean = &all.front();
+      for (const Candidate& c : all) {
+        if (std::make_pair(c.device(), c.host_without_cache) <
+            std::make_pair(lean->device(), lean->host_without_cache)) {
+          lean = &c;
+        }
+      }
+      ExecutionPlan p = make_plan(*lean, all);
+      p.explanation +=
+          "\nWARNING (soft VRAM budget): no configuration fits the dedicated-VRAM/host budget; running the leanest "
+          "plan anyway. CUDA will spill into shared GPU memory (system RAM): expect heavy stalls and possible "
+          "instability. Set MI_SOFT_VRAM_BUDGET=0 for the strict budget.";
+      return p;
+    }
     const Candidate* best = *std::min_element(feasible.begin(), feasible.end(),
                                               [&](const Candidate* a, const Candidate* b) { return rank(*a) < rank(*b); });
     return make_plan(*best, all);
@@ -783,6 +800,21 @@ void dit_shapes(const weights::ModelIndex& index, ModelShapes& s) {
 }
 
 }  // namespace
+
+// By default, return the leanest plan with a warning instead of throwing when nothing fits the dedicated-VRAM/host
+// budgets; the runtime may then spill into shared GPU memory. MI_SOFT_VRAM_BUDGET=0 restores the strict budget.
+namespace {
+std::optional<bool> g_soft_vram_override;
+}
+bool soft_vram_budget() {
+  if (g_soft_vram_override) return *g_soft_vram_override;
+  static const bool enabled = [] {
+    const char* e = std::getenv("MI_SOFT_VRAM_BUDGET");
+    return e == nullptr || (e[0] != '\0' && e[0] != '0');
+  }();
+  return enabled;
+}
+void set_soft_vram_budget(bool enabled) { g_soft_vram_override = enabled; }
 
 const char* mode_name(Mode mode) {
   switch (mode) {

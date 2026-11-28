@@ -19,6 +19,12 @@ namespace {
 
 using namespace mi::planner;
 
+// The runtime defaults to a soft VRAM budget; these tests assert exact BudgetError behaviour, so keep them strict.
+const bool kStrictBudgetForTests = [] {
+  set_soft_vram_budget(false);
+  return true;
+}();
+
 constexpr double kGiBd = 1024.0 * 1024.0 * 1024.0;
 std::size_t gib(double g) { return static_cast<std::size_t>(g * kGiBd); }
 

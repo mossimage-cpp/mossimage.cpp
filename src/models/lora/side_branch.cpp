@@ -1,5 +1,7 @@
 #include "models/lora/side_branch.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -11,7 +13,9 @@
 #include <thread>
 #include <vector>
 
+#include "kernels/basic/elementwise.h"
 #include "kernels/lora/lora_kernels.h"
+#include "kernels/sm75/sm75.h"
 #include "weights/quant/quant_codec.h"
 
 namespace mi::lora {
@@ -70,7 +74,11 @@ struct Plan {
   std::size_t coef_bytes = 0, bytes = 0;
 };
 
+// On Turing both LoRA GEMMs run fp32, so A and B are uploaded as fp32; on other devices both factors stay bf16.
 Plan make_plan(const LoraStack& stack) {
+  const bool sm75 = kernels::sm75::turing();
+  const int a_bytes = sm75 ? 4 : 2;
+  const int b_bytes = sm75 ? 4 : 2;
   const TargetModel& model = stack.model();
   Plan plan;
   plan.blocks = model.blocks;
@@ -128,10 +136,10 @@ Plan make_plan(const LoraStack& stack) {
   for (SitePlan& sp : plan.sites) {
     if (sp.slices.empty()) continue;
     sp.a_offset = off;
-    off = align_up(off + static_cast<std::size_t>(sp.rank * sp.k) * 2);
+    off = align_up(off + static_cast<std::size_t>(sp.rank * sp.k) * a_bytes);
     for (SlicePlan& sl : sp.slices) {
       sl.b_offset = off;
-      off = align_up(off + static_cast<std::size_t>(sl.rows * (sp.shared_cols + sl.own_cols)) * 2);
+      off = align_up(off + static_cast<std::size_t>(sl.rows * (sp.shared_cols + sl.own_cols)) * b_bytes);
     }
   }
   plan.bytes = off;
@@ -164,8 +172,11 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
   if (plan.bytes == 0) return;
   coef_bytes_ = plan.coef_bytes;
   buffer_ = DeviceBuffer(plan.bytes);
-  std::vector<std::uint16_t> host(plan.bytes / 2, 0);  // bf16 staging of every factor (coefficients written later)
-  const auto at = [&](std::size_t offset) { return host.data() + offset / 2; };
+  // Turing's LoRA GEMMs use cuBLASLt's fp32 path; the factors are small enough to upload as fp32 directly.
+  const bool sm75 = kernels::sm75::turing();
+  const DType factor_dtype = sm75 ? DType::kF32 : DType::kBF16;
+  std::vector<std::byte> host(plan.bytes, std::byte{0});  // staging of every factor (coefficients written later)
+  const auto at = [&](std::size_t offset) { return host.data() + offset; };
   for (const SitePlan& sp : plan.sites) {
     if (!sp.slices.empty()) max_rank_ = std::max(max_rank_, sp.rank);
   }
@@ -179,13 +190,18 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
     br.n = sp.n;
     br.k = sp.k;
     br.rank = sp.rank;
-    br.a = view_at(buffer_.get(), sp.a_offset, DType::kBF16, {sp.rank, sp.k});
+    br.a = view_at(buffer_.get(), sp.a_offset, factor_dtype, {sp.rank, sp.k});
     br.coef = view_at(buffer_.get(), sp.coef_offset, DType::kF32, {sp.rank});
     const bool permute = static_cast<Site>(e % kSites) == Site::kUpGate;
     const auto put_a = [&](const Adapter& a, std::int64_t col0) {
       const std::vector<float> down = stack.read(a.parts[0]);  // [r, k]
-      std::uint16_t* arow = at(sp.a_offset) + col0 * sp.k;
-      for (std::size_t i = 0; i < down.size(); ++i) arow[i] = quant::float_to_bf16(down[i]);
+      if (sm75) {
+        auto* arow = reinterpret_cast<float*>(at(sp.a_offset)) + col0 * sp.k;
+        for (std::size_t i = 0; i < down.size(); ++i) arow[i] = down[i];
+      } else {
+        auto* arow = reinterpret_cast<std::uint16_t*>(at(sp.a_offset)) + col0 * sp.k;
+        for (std::size_t i = 0; i < down.size(); ++i) arow[i] = quant::float_to_bf16(down[i]);
+      }
     };
     for (std::size_t g = 0; g < sp.shared_first.size(); ++g) {
       const Adapter& a = stack.adapters()[sp.shared_first[g]];
@@ -206,15 +222,21 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
         out.col0 = sl.own_col0;
         out.cols = sl.own_cols;
       }
-      out.b = view_at(buffer_.get(), sl.b_offset, DType::kBF16, {sl.rows, cols});
+      out.b = view_at(buffer_.get(), sl.b_offset, factor_dtype, {sl.rows, cols});
       br.slices.push_back(out);
-      std::uint16_t* b = at(sl.b_offset);
+      auto* b16 = reinterpret_cast<std::uint16_t*>(at(sl.b_offset));
+      auto* b32 = reinterpret_cast<float*>(at(sl.b_offset));
       const auto put_b = [&](const Adapter& a, std::int64_t bcol) {
         const std::vector<float> up = stack.read(a.parts[1], a.row0, a.n);  // [n, r]
         for (std::int64_t c = 0; c < sl.rows; ++c) {
           const std::int64_t src = permute ? kernels::lora::up_gate_gemm_row(c, sl.rows / 2) : c;
           for (std::int64_t j = 0; j < a.rank; ++j) {
-            b[c * cols + bcol + j] = quant::float_to_bf16(up[static_cast<std::size_t>(src * a.rank + j)]);
+            const float v = up[static_cast<std::size_t>(src * a.rank + j)];
+            if (sm75) {
+              b32[c * cols + bcol + j] = v;  // exact: the delta GEMM runs in fp32
+            } else {
+              b16[c * cols + bcol + j] = quant::float_to_bf16(v);
+            }
           }
         }
       };
@@ -343,9 +365,14 @@ bool SideBranches::any_active() const {
   return std::any_of(entries_.begin(), entries_.end(), [](const Entry& e) { return e.active; });
 }
 
-std::size_t t_workspace_bytes(std::int64_t m, std::int64_t rank) {
-  if (m < 0 || rank < 0) fail("t_workspace_bytes: negative size");
-  return align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(rank) * 4);
+std::size_t t_workspace_bytes(std::int64_t m, std::int64_t k, std::int64_t rank) {
+  if (m < 0 || k < 0 || rank < 0) fail("t_workspace_bytes: negative size");
+  // Turing: x is converted bf16 -> fp32 in the front of the workspace, t32 follows. Other devices keep the fp16
+  // GEMM path and need only the fp32 t accumulator.
+  const std::size_t acc = align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(rank) * 4);
+  return kernels::sm75::turing()
+             ? align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(k) * 4) + acc
+             : acc;
 }
 
 void compute_t(const SiteBranch& site, const Tensor& x, const Tensor& t, void* workspace, std::size_t workspace_bytes,
@@ -354,19 +381,40 @@ void compute_t(const SiteBranch& site, const Tensor& x, const Tensor& t, void* w
     fail("compute_t: x must be CUDA bf16 [m, " + std::to_string(site.k) + "] rows, got " + x.describe());
   }
   const std::int64_t m = x.dim(0), r = site.rank;
-  if (t.device != Device::kCUDA || t.dtype != DType::kBF16 || t.rank != 2 || t.dim(0) != m || t.dim(1) != r ||
+  const bool sm75 = kernels::sm75::turing();
+  const DType t_dtype = sm75 ? DType::kF32 : DType::kBF16;
+  if (t.device != Device::kCUDA || t.dtype != t_dtype || t.rank != 2 || t.dim(0) != m || t.dim(1) != r ||
       t.stride[1] != 1 || t.stride[0] < r || t.stride[0] % 8 != 0 || reinterpret_cast<std::uintptr_t>(t.data) % 16 != 0) {
-    fail("compute_t: t must be CUDA bf16 [" + std::to_string(m) + ", " + std::to_string(r) +
-         "] rows (16-byte aligned, stride a multiple of 8), got " + t.describe());
+    fail("compute_t: t must be CUDA " + std::string(sm75 ? "f32" : "bf16") + " [" + std::to_string(m) + ", " +
+         std::to_string(r) + "] rows (16-byte aligned, stride a multiple of 8), got " + t.describe());
   }
-  if (workspace_bytes < t_workspace_bytes(m, r) || reinterpret_cast<std::uintptr_t>(workspace) % kAlign != 0) {
+  if (workspace_bytes < t_workspace_bytes(m, site.k, r) || reinterpret_cast<std::uintptr_t>(workspace) % kAlign != 0) {
     fail("compute_t: workspace too small or not 256-byte aligned");
   }
   if (m == 0) return;
-  const Tensor t32 = Tensor::view(workspace, DType::kF32, Device::kCUDA, {m, r});
-  gemm.linear(t32, x, site.a, nullptr, gemm_ws, gemm_ws_bytes, stream);
-  kernels::lora::scale_columns_bf16(t32.ptr<const float>(), r, site.coef.ptr<const float>(),
-                                    static_cast<__nv_bfloat16*>(t.data), t.stride[0], m, r, stream);
+  auto* bytes = static_cast<std::byte*>(workspace);
+  const std::size_t x32_off = sm75 ? align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(site.k) * 4) : 0;
+  const Tensor t32 = Tensor::view(bytes + x32_off, DType::kF32, Device::kCUDA, {m, r});
+  Tensor a = site.a;
+  if (a.dtype != (sm75 ? DType::kF32 : DType::kBF16)) {
+    fail("compute_t: LoRA A factors have the wrong dtype");
+  }
+  if (sm75) {
+    // bf16 -> fp32 is exact; both GEMMs then use cuBLASLt's fast fp32 path (no fp16 intermediate).
+    const Tensor x32 = Tensor::view(bytes, DType::kF32, Device::kCUDA, {m, site.k});
+    kernels::cast(x, x32, stream);
+    gemm.linear_f32(t32, x32, a, gemm_ws, gemm_ws_bytes, stream);
+  } else {
+    gemm.linear(t32, x, a, nullptr, gemm_ws, gemm_ws_bytes, stream);
+  }
+  if (sm75) {
+    // Keep t in fp32: the small-K delta GEMM then runs cuBLASLt's fp32 kernels (~4.5x its fp16 kernels here).
+    kernels::lora::scale_columns_f32(t32.ptr<const float>(), r, site.coef.ptr<const float>(), t.ptr<float>(),
+                                     t.stride[0], m, r, stream);
+  } else {
+    kernels::lora::scale_columns_bf16(t32.ptr<const float>(), r, site.coef.ptr<const float>(),
+                                      static_cast<__nv_bfloat16*>(t.data), t.stride[0], m, r, stream);
+  }
 }
 
 kernels::lora::LoraSlices lora_slices(const SiteBranch& site, const Tensor& t) {
@@ -383,18 +431,24 @@ kernels::lora::LoraSlices lora_slices(const SiteBranch& site, const Tensor& t) {
   return l;
 }
 
-std::size_t delta_scratch_bytes(std::int64_t m, std::int64_t rank, std::int64_t n) {
+std::size_t delta_scratch_bytes(std::int64_t m, std::int64_t rank, std::int64_t n, bool f32_out) {
   if (m < 0 || rank < 0 || n < 0) fail("delta_scratch_bytes: negative size");
-  return align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(rank) * 2) +
-         align_up(static_cast<std::size_t>(n) * static_cast<std::size_t>(rank) * 2);
+  // Sized for fp32 operands (Turing's delta GEMM); the extra 2x on other devices is a few hundred KiB. cuBLASLt
+  // cannot write bf16 directly from fp32 operands on sm_75, so Turing also needs a fp32 output tile.
+  return align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(rank) * 4) +
+         align_up(static_cast<std::size_t>(n) * static_cast<std::size_t>(rank) * 4) +
+         (f32_out ? align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(n) * 4) : 0);
 }
 
 void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta, bool natural_order, void* scratch,
                    std::size_t scratch_bytes, kernels::Gemm& gemm, void* gemm_ws, std::size_t gemm_ws_bytes,
                    cudaStream_t stream) {
   const std::int64_t m = t.rank == 2 ? t.dim(0) : -1, r = site.rank, n = site.n;
-  if (t.device != Device::kCUDA || t.dtype != DType::kBF16 || m < 0 || t.dim(1) != r || t.stride[1] != 1) {
-    fail("compute_delta: t must be CUDA bf16 [m, " + std::to_string(r) + "] rows, got " + t.describe());
+  const bool sm75 = kernels::sm75::turing();
+  const DType t_dtype = sm75 ? DType::kF32 : DType::kBF16;
+  if (t.device != Device::kCUDA || t.dtype != t_dtype || m < 0 || t.dim(1) != r || t.stride[1] != 1) {
+    fail("compute_delta: t must be CUDA " + std::string(sm75 ? "f32" : "bf16") + " [m, " + std::to_string(r) +
+         "] rows, got " + t.describe());
   }
   if (delta.device != Device::kCUDA || delta.dtype != DType::kBF16 || delta.rank != 2 || delta.dim(0) != m ||
       delta.dim(1) != n || delta.stride[1] != 1 || delta.stride[0] < n || delta.stride[0] % 8 != 0 ||
@@ -402,21 +456,24 @@ void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta,
     fail("compute_delta: delta must be CUDA bf16 [" + std::to_string(m) + ", " + std::to_string(n) +
          "] rows (16-byte aligned, stride a multiple of 8), got " + delta.describe());
   }
-  if (scratch_bytes < delta_scratch_bytes(m, r, n) || reinterpret_cast<std::uintptr_t>(scratch) % kAlign != 0) {
+  if (scratch_bytes < delta_scratch_bytes(m, r, n, sm75) || reinterpret_cast<std::uintptr_t>(scratch) % kAlign != 0) {
     fail("compute_delta: scratch too small or not 256-byte aligned");
   }
   if (m == 0) return;
-  constexpr std::size_t kE = sizeof(std::uint16_t);
+  // t, the factors and the scratch are fp32 on Turing; delta is always bf16, so its byte offsets use a separate size.
+  const std::size_t kE = sm75 ? sizeof(float) : sizeof(std::uint16_t);
+  constexpr std::size_t kOutE = sizeof(std::uint16_t);
   auto* const out = static_cast<std::byte*>(delta.data);
-  const std::size_t pitch = static_cast<std::size_t>(delta.stride[0]) * kE;
+  const std::size_t pitch = static_cast<std::size_t>(delta.stride[0]) * kOutE;
   const auto zero = [&](std::int64_t c0, std::int64_t c1) {
     if (c1 > c0) {
-      MI_CUDA_CHECK(cudaMemset2DAsync(out + c0 * kE, pitch, 0, static_cast<std::size_t>(c1 - c0) * kE,
+      MI_CUDA_CHECK(cudaMemset2DAsync(out + c0 * kOutE, pitch, 0, static_cast<std::size_t>(c1 - c0) * kOutE,
                                       static_cast<std::size_t>(m), stream));
     }
   };
   auto* const tcat = static_cast<std::byte*>(scratch);
   auto* const bnat = tcat + align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(r) * kE);
+  auto* const f32out = bnat + align_up(static_cast<std::size_t>(n) * static_cast<std::size_t>(r) * kE);
   const auto* const tp = static_cast<const std::byte*>(t.data);
   const std::size_t tpitch = static_cast<std::size_t>(t.stride[0]) * kE;
   std::int64_t covered = 0;
@@ -424,7 +481,7 @@ void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta,
     zero(covered, s.row0);
     covered = s.row0 + s.rows;
     const std::int64_t c = s.cols + s.colsb;
-    Tensor x = Tensor::view(const_cast<std::byte*>(tp) + s.col0 * kE, DType::kBF16, Device::kCUDA, {m, s.cols});
+    Tensor x = Tensor::view(const_cast<std::byte*>(tp) + s.col0 * kE, t_dtype, Device::kCUDA, {m, s.cols});
     x.stride[0] = t.stride[0];
     if (s.colsb > 0) {
       const std::size_t cp = static_cast<std::size_t>(c) * kE;
@@ -433,9 +490,10 @@ void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta,
       MI_CUDA_CHECK(cudaMemcpy2DAsync(tcat + s.cols * kE, cp, tp + s.col0b * kE, tpitch,
                                       static_cast<std::size_t>(s.colsb) * kE, static_cast<std::size_t>(m),
                                       cudaMemcpyDeviceToDevice, stream));
-      x = Tensor::view(tcat, DType::kBF16, Device::kCUDA, {m, c});
+      x = Tensor::view(tcat, t_dtype, Device::kCUDA, {m, c});
     }
     Tensor b = s.b;
+    if (b.dtype != (sm75 ? DType::kF32 : DType::kBF16)) fail("compute_delta: LoRA B factors have the wrong dtype");
     if (natural_order) {
       // GEMM column 8j + 4h + i (h: 0 hidden, 1 gate; i < 4) is weight row h * F + 4j + i (up_gate_gemm_row).
       if (s.row0 != 0 || s.rows != n || n % 8 != 0) fail("compute_delta: natural_order needs one slice over all columns");
@@ -445,11 +503,17 @@ void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta,
         MI_CUDA_CHECK(cudaMemcpy2DAsync(bnat + h * half, group, bp + h * group, 2 * group, group,
                                         static_cast<std::size_t>(n / 8), cudaMemcpyDeviceToDevice, stream));
       }
-      b = Tensor::view(bnat, DType::kBF16, Device::kCUDA, {n, c});
+      b = Tensor::view(bnat, s.b.dtype, Device::kCUDA, {n, c});
     }
-    Tensor o = Tensor::view(out + s.row0 * kE, DType::kBF16, Device::kCUDA, {m, s.rows});
+    Tensor o = Tensor::view(out + s.row0 * kOutE, DType::kBF16, Device::kCUDA, {m, s.rows});
     o.stride[0] = delta.stride[0];
-    gemm.linear(o, x, b, nullptr, gemm_ws, gemm_ws_bytes, stream);
+    if (sm75) {
+      Tensor of32 = Tensor::view(f32out, DType::kF32, Device::kCUDA, {m, s.rows});
+      gemm.linear_f32(of32, x, b, gemm_ws, gemm_ws_bytes, stream);
+      kernels::cast(of32, o, stream);
+    } else {
+      gemm.linear(o, x, b, nullptr, gemm_ws, gemm_ws_bytes, stream);
+    }
   }
   zero(covered, n);
 }

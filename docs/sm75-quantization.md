@@ -13,8 +13,9 @@ first-class (and to produce the files) are listed below with a plan.
 | `turbo` | INT4 ConvRot (`convrot_w4a4`) or NVFP4 | 8-bit | an INT4/NVFP4 DiT file (NVFP4 needs an RTX 50) |
 
 `planner::resolve_tier` (src/planner/planner.cpp) enforces that: `high` with exact attention on a bf16 DiT is "the
-Reference configuration" and is refused, and on sm_75 the missing 8-bit attention kernels make `exact_when_no_q8` pick
-exact attention, so `high` needs an INT8 DiT file. `turbo` only accepts a 4-bit file.
+Reference configuration" and is refused. On sm_75 an unset attention resolves to `q8_fp16` like on other GPUs (its QK
+uses native DP4A), so `high` needs an INT8 DiT file; Volta, which has no 8-bit kernel, keeps the explicit exact fallback.
+`turbo` only accepts a 4-bit file.
 
 ## What already works on sm_75
 

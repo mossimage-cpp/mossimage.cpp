@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 
 #include "core/cuda_check.h"
@@ -65,6 +66,33 @@ bool fp16_weights() {
     cached[device].store(major, std::memory_order_relaxed);
   }
   return major < 8;
+}
+
+bool no_tensor_cores() {
+  static std::atomic<int> cached[64];
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (device < 0 || device >= 64) return false;
+  int state = cached[device].load(std::memory_order_relaxed);
+  if (state == 0) {
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, device) != cudaSuccess) {
+      cudaGetLastError();
+      return false;
+    }
+    // sm_75 says nothing about tensor cores: TU106/TU104/TU102 (RTX 20xx, T4) have them, TU116/TU117 (GTX 16xx)
+    // do not. The part name is the reliable distinction; the SM count is a fallback for stripped driver names.
+    const std::string name(p.name);
+    const bool gtx16 = name.find("GTX 16") != std::string::npos || name.find("TU116") != std::string::npos ||
+                       name.find("TU117") != std::string::npos;
+    const bool small_turing = p.major == 7 && p.minor == 5 && p.multiProcessorCount <= 22;
+    state = (gtx16 || small_turing) ? 2 : 1;
+    cached[device].store(state, std::memory_order_relaxed);
+  }
+  return state == 2;
 }
 
 void convert_weight_inplace(Tensor& w, cudaStream_t stream) {
